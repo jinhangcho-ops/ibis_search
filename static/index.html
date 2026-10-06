@@ -65,9 +65,16 @@
   #flat .row { align-items:center; margin-bottom:2px; }
   #flat-list label, .checks label { display:block; white-space:nowrap; }
   #flat-list input, .checks input { width:auto; }
-  #scols-box { margin-bottom:6px; }
-  #scols-box summary { cursor:pointer; }
-  #scols-box .row { align-items:center; margin:4px 0 2px; }
+  /* 카드 제목 줄: 제목 옆에 버튼과 고르는 칸, 그 오른쪽에 고른 것들(칩)이 한 줄로 놓인다. */
+  .head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:10px; }
+  .head h3 { margin:0; flex:none; }
+  .head select { width:auto; max-width:200px; flex:none; }
+  .chips { display:flex; flex:1 1 160px; min-width:0; gap:4px; align-items:center; overflow:hidden; }
+  .chips.open { flex-wrap:wrap; }
+  .chips .hint { margin:0; white-space:nowrap; }
+  .chip { flex:none; background:var(--bg); border-radius:6px; padding:2px 2px 2px 8px; font-size:12px; white-space:nowrap; }
+  .chip.more { padding:2px 8px; color:var(--accent); cursor:pointer; }
+  #err-summary:empty { display:none; }  /* 알릴 것이 없으면 제목 줄과 표 사이를 비우지 않는다. */
   /* 조건 입력 방식: 칸으로 선택(.fields)이면 한 줄 입력칸과 형식 안내를, 한 줄 입력(.line)이면 칸들을 감춘다. 조건 목록은 둘 다 같이 쓴다. */
   #cond.fields :is(#conditions .row, .format), #cond.line #builder { display:none; }
   #builder .row select { flex:1; min-width:0; }
@@ -193,13 +200,12 @@
       <div class="grip-y" data-size="rows" title="끌어서 결과 표 높이 조절 (더블클릭: 기본)"></div>
     </section>
     <section class="card">
-      <h3>집계</h3>
-      <div class="row"><button id="summarize">집계 계산</button></div>
-      <details id="scols-box">
-        <summary class="hint" id="scols-count"></summary>
-        <div class="row"><button class="ghost" id="scols-all">모두 선택</button><button class="ghost" id="scols-none">모두 해제</button></div>
-        <div class="cols checks" id="scols"></div>
-      </details>
+      <div class="head">
+        <h3>집계</h3>
+        <button id="summarize">집계 계산</button>
+        <select id="scol-add" title="집계할 컬럼을 고릅니다. 하나도 고르지 않으면 전체를 집계합니다"></select>
+        <div class="chips" id="scols"></div>
+      </div>
       <div class="err" id="err-summary"></div>
       <div class="table-wrap" id="summary"></div>
       <div class="row save"><span class="hint">집계 표 저장</span>
@@ -341,7 +347,7 @@ document.querySelectorAll("input[name=kind]").forEach(r => r.onchange = () => {
   $("folder-box").classList.toggle("hidden", !folder);
   $("url-box").classList.toggle("hidden", folder);
 });
-// 체크 목록: box 안에 값마다 체크 칸을 만든다. keep에 든 값은 체크해 둔다. checked(box)는 체크한 값들.
+// 체크 목록: box 안에 값마다 체크 칸을 만든다. keep에 든 값은 체크해 둔다.
 function checks(box, values, keep = []) {
   box.replaceChildren(...values.map(v => {
     const label = document.createElement("label"), input = Object.assign(document.createElement("input"), { type: "checkbox", value: v, checked: keep.includes(v) });
@@ -349,20 +355,42 @@ function checks(box, values, keep = []) {
     return label;
   }));
 }
-function checked(box) { return [...box.querySelectorAll("input:checked")].map(i => i.value); }
 // 집계할 컬럼: 고르지 않으면 전체(표시 컬럼을 정했으면 그 컬럼들), 고르면 그 컬럼만 집계한다. 컬럼 목록이 바뀌어도 고른 것은 남긴다.
+// 제목 옆 칸에서 고르면 그 오른쪽에 ×가 달린 칩으로 놓인다. 한 줄에 다 안 들어가면 들어가는 만큼만 보이고 나머지는 "… 외 N개"로 줄인다(누르면 펼침).
+let scols = [], scolsOpen = false;
 function showSummaryCols() {
-  const n = checked($("scols")).length;
-  $("scols-count").textContent = n ? `집계할 컬럼: ${n} / ${S.cols.length}개 선택` : "집계할 컬럼: 전체";
+  const box = $("scols");
+  const chip = name => {
+    const item = Object.assign(document.createElement("span"), { className: "chip", textContent: name });
+    const remove = Object.assign(document.createElement("button"), { className: "ghost", textContent: "×", title: "빼기" });
+    remove.onclick = () => { scols = scols.filter(c => c !== name); fillSummaryCols(); };
+    item.append(remove);
+    return item;
+  };
+  const toggle = (text, title) => {
+    const item = Object.assign(document.createElement("span"), { className: "chip more", textContent: text, title });
+    item.onclick = () => { scolsOpen = !scolsOpen; showSummaryCols(); };
+    return item;
+  };
+  if (!scols.length) scolsOpen = false;
+  box.classList.toggle("open", scolsOpen);
+  if (!scols.length) { box.innerHTML = '<span class="hint">전체 컬럼</span>'; return; }
+  box.replaceChildren(...scols.map(chip));
+  if (scolsOpen) { box.append(toggle("접기", "한 줄로 줄입니다")); return; }
+  for (let shown = scols.length; shown > 0 && box.scrollWidth > box.clientWidth; ) {
+    shown--;
+    box.replaceChildren(...scols.slice(0, shown).map(chip), toggle(`… 외 ${scols.length - shown}개`, scols.slice(shown).join(", ")));
+  }
 }
 function fillSummaryCols() {
-  checks($("scols"), S.cols.map(c => c[0]), checked($("scols")));
+  const names = S.cols.map(c => c[0]);
+  scols = scols.filter(c => names.includes(c));
+  fill($("scol-add"), names.filter(c => !scols.includes(c)), "집계할 컬럼 추가");
   showSummaryCols();
 }
-$("scols").onchange = showSummaryCols;
-$("scols-all").onclick = () => { $("scols").querySelectorAll("input").forEach(i => i.checked = true); showSummaryCols(); };
-$("scols-none").onclick = () => { $("scols").querySelectorAll("input").forEach(i => i.checked = false); showSummaryCols(); };
-showSummaryCols();
+$("scol-add").onchange = () => { if ($("scol-add").value) { scols.push($("scol-add").value); fillSummaryCols(); } };
+new ResizeObserver(showSummaryCols).observe($("scols"));  // 카드 너비가 바뀌면 다시 맞춘다.
+fillSummaryCols();
 
 // Parquet·CSV는 여러 개를 골라 연다(파일마다 테이블 하나). 파일 목록에서 이 항목을 고르면 체크 목록이 나온다.
 const FLAT = "*flat";  // 파일 이름에 쓸 수 없는 글자로 시작해 실제 경로와 겹치지 않는다.
@@ -598,7 +626,7 @@ $("summarize").onclick = () => {
   return busy($("summarize"), async () => {
     const before = last;
     try {
-      const { summary } = await timed("summary", () => api("/api/summary", { ...state(), summary_columns: checked($("scols")) }));
+      const { summary } = await timed("summary", () => api("/api/summary", { ...state(), summary_columns: scols }));
       if (last !== before) return;  // 계산하는 사이 새로 검색했으면 버린다.
       last = { ...last, summary };
       renderTables();

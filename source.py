@@ -53,7 +53,7 @@ def open_flat_files(paths):
     return con
 
 
-CONNECT_TIMEOUT = 30  # 주소로 접속할 때 기다리는 시간(초). 틀린 주소에서 드라이버가 몇 분씩 붙잡는 것을 막는다.
+CONNECT_TIMEOUT = 60  # 주소로 접속할 때 기다리는 시간(초). 틀린 주소에서 드라이버가 몇 분씩 붙잡는 것을 막는다.
 
 
 def within(seconds, connect):
