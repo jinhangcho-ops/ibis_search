@@ -40,7 +40,9 @@
   input, select, button { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; width:100%; }
   input, select { background:var(--card); color:var(--text); }
   #theme, #resize { float:right; }
-  #usage, #timing { margin:0; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  #usage, #timing { margin:0; font-variant-numeric:tabular-nums; }
+  #usage { clear:both; }  /* 버튼 아래 줄에서 시작. 좁으면 "|" 앞에서만 줄을 바꾼다. */
+  #usage span { white-space:nowrap; }
   #timing { margin-bottom:6px; }
   button { background:var(--accent); color:#fff; border:none; cursor:pointer; width:auto; padding:6px 12px; flex:none; white-space:nowrap; }
   button:disabled { opacity:.55; cursor:wait; }
@@ -107,8 +109,8 @@
   <aside class="panel">
     <button id="theme" class="ghost"></button>
     <button id="resize" class="ghost" title="켜면 패널·표·차트의 경계를 끌어 크기를 바꿀 수 있습니다"></button>
-    <div class="hint" id="usage" title="이 프로그램(화면 포함)이 쓰는 메모리와 CPU. DB 주소로 연결하면 연산은 DB 서버가 합니다">&nbsp;</div>
-    <div class="hint" id="timing" title="예상: 테이블 행 수 × 직전 실행의 행당 시간. 조건에 따라 빗나갈 수 있습니다">&nbsp;</div>
+    <div class="hint" id="usage" title="PC 전체의 점유율 | 이 프로그램(화면 포함)의 점유율. DB 주소로 연결하면 연산은 DB 서버가 합니다">&nbsp;<br>&nbsp;</div>
+    <div class="hint" id="timing" title="검색한 뒤로 돌린 검색·집계·차트·저장 시간의 합계. 예상: 테이블 행 수 × 직전 실행의 행당 시간">&nbsp;</div>
     <h2>1. 연결</h2>
     <div class="tabs">
       <label><input type="radio" name="kind" value="folder" checked style="width:auto"> 내 폴더 파일</label>
@@ -286,36 +288,50 @@ async function busy(button, fn) {
   finally { button.disabled = false; button.textContent = label; button.style.minWidth = ""; }
 }
 
-// 상단 표시: 메모리·CPU는 2초마다 읽는다.
+// 상단 표시: 메모리·CPU(PC 전체 | 이 프로그램)는 2초마다 읽는다.
 async function showUsage() {
-  try { const d = await api("/api/usage"); $("usage").textContent = `메모리 ${d.memory.toLocaleString()}MB · CPU ${d.cpu}%`; } catch (e) {}
+  try { const d = await api("/api/usage"); $("usage").innerHTML = `<span>메모리  전체 ${d.pc_memory}%</span> <span>| 프로그램 ${d.memory}% (${d.memory_mb.toLocaleString()}MB)</span><br><span>CPU  전체 ${d.pc_cpu}%</span> <span>| 프로그램 ${d.cpu}%</span>`; } catch (e) {}
 }
 showUsage();
 setInterval(showUsage, 2000);
-// 작업 시간: "예상 | 경과"가 흐르다가 끝나면 "예상 | 실제"로 남는다.
-// 예상 = 기준 테이블 행 수 × 그 작업 종류의 직전 행당 시간(나노초/행, 설정으로 기억). 한 번도 안 해 본 종류는 "—".
-const KINDS = { search: "검색", summary: "집계", chart: "차트", export: "저장" };
-const rates = Object.fromEntries(Object.keys(KINDS).map(k => [k, +saved("time_" + k) || 0]));
+// 전체 시간: [검색]을 누르면 0에서 다시 시작하고, 그 뒤의 집계·차트·저장 시간을 더해 간다. 도는 동안은 "예상 | 경과", 끝나면 "예상 | 실제".
+// 작업 하나의 예상 = 기준 테이블 행 수 × 그 작업 종류의 직전 행당 시간(나노초/행, 설정으로 기억). 한 번도 안 해 본 종류는 예상에 더하지 않는다.
+const KINDS = ["search", "summary", "chart", "export"];
+const rates = Object.fromEntries(KINDS.map(k => [k, +saved("time_" + k) || 0]));
 const secs = ms => (ms / 1000).toFixed(1) + "초";
-let timer, running = 0;
-async function timed(kind, fn) {
-  const start = performance.now(), run = ++running;
-  let guess = "—", rows = 0;
-  const show = word => { if (run === running) $("timing").textContent = `${KINDS[kind]}  예상 ${guess} | ${word} ${secs(performance.now() - start)}`; };
+let total = { guess: 0, done: 0 }, timer;  // 예상 합계와 끝난 작업의 시간 합계(ms)
+const going = new Set();  // 지금 도는 작업들의 시작 시각
+function showTiming() {
+  const now = performance.now(), ms = total.done + [...going].reduce((sum, run) => sum + now - run.at, 0);
+  $("timing").textContent = `전체  예상 ${total.guess ? secs(total.guess) : "—"} | ${going.size ? "경과" : "실제"} ${secs(ms)}`;
+}
+function resetTiming() {
+  total = { guess: 0, done: 0 };
+  going.clear();
   clearInterval(timer);
-  timer = setInterval(() => show("경과"), 100);
+  $("timing").innerHTML = "&nbsp;";
+}
+async function timed(kind, fn) {
+  if (kind === "search") resetTiming();
+  const mine = total, run = { at: performance.now() };  // 도는 사이 새로 검색하면 이 작업의 시간은 새 합계에 넣지 않는다.
+  going.add(run);
+  clearInterval(timer);
+  timer = setInterval(showTiming, 100);
   try {
-    rows = (await api("/api/rowcount", { schema: S.schema, base: S.base })).rows;
-    if (rows && rates[kind]) guess = secs(rates[kind] * rows / 1e6);
+    const rows = (await api("/api/rowcount", { schema: S.schema, base: S.base })).rows;
+    if (rows && rates[kind]) mine.guess += rates[kind] * rows / 1e6;
     const out = await fn();
     if (rows) {
-      rates[kind] = Math.min(Math.max(Math.round((performance.now() - start) * 1e6 / rows), 1), 1e12);
+      rates[kind] = Math.min(Math.max(Math.round((performance.now() - run.at) * 1e6 / rows), 1), 1e12);
       saveSetting({ ["time_" + kind]: rates[kind] });
     }
     return out;
   } finally {
-    if (run === running) clearInterval(timer);
-    show("실제");
+    if (going.delete(run)) {
+      mine.done += performance.now() - run.at;
+      if (!going.size) clearInterval(timer);
+      showTiming();
+    }
   }
 }
 
@@ -377,6 +393,7 @@ function clearScreen() {
   $("rows-title").textContent = "결과";
   renderTables();
   ["err-search", "err-export", "err-summary", "err-chart", "err-builder"].forEach(id => $(id).textContent = "");
+  resetTiming();
 }
 // [모두 해제]: 체크를 모두 푼다. Parquet·CSV로 연결돼 있었으면 그 연결을 끊고 화면을 연결 전으로 되돌린다(파일을 다시 골라 새로 연결).
 // DuckDB 파일이나 DB 주소로 연결돼 있었으면 연결은 그대로 두고 화면에 올라온 것만 비운다.
