@@ -176,7 +176,9 @@ def query():
 @app.post("/api/summary")
 def summary():
     """컬럼별 집계. 큰 테이블에서는 오래 걸리므로 검색과 따로, 화면에서 요청할 때만 계산한다."""
-    return jsonify(summary=to_json(result.get_summary(build(request.json))))
+    columns = request.json.get("summary_columns") or []  # 화면에서 고른 컬럼. 없으면 표시 컬럼(없으면 전체).
+    rows = result.get_summary(build(request.json, select=not columns), columns)
+    return jsonify(summary={"columns": result.SUMMARY_COLS, "rows": rows})
 
 
 @app.post("/api/export")
@@ -206,8 +208,9 @@ def export():
 
 @app.post("/api/chart")
 def chart():
+    """x별 집계. series는 [{"y", "agg"}]이고, split을 주면 그 컬럼의 값마다 계열을 나눈다."""
     body = request.json
-    df = result.get_chart(build(body, select=False), body["x"], body.get("y"), body["agg"], body.get("order", "x"))
-    return jsonify(
-        labels=[str(v) for v in df[body["x"]]], values=df["value"].to_list(), max_groups=result.MAX_GROUPS
-    )
+    labels, datasets, more = result.get_chart(
+        build(body, select=False), body["x"], body.get("series") or [], body.get("split") or None, body.get("order", "x"))
+    return jsonify(labels=[str(v) for v in labels], datasets=datasets, more_splits=more,
+                   max_groups=result.MAX_GROUPS, max_splits=result.MAX_SPLITS)

@@ -15,8 +15,10 @@
   for (const name in SIZES) if (saved(name)) document.documentElement.style.setProperty("--" + name, saved(name) + "px");
 </script>
 <style>
-  :root { --bg:#f4f5f7; --card:#fff; --head:#f9fafb; --line:#dde1e6; --text:#1f2933; --muted:#6b7480; --accent:#2f5bea; --err:#c62828; --ok:#2e7d32; color-scheme:light; }
-  :root[data-theme=dark] { --bg:#15171c; --card:#1e2128; --head:#262a33; --line:#343945; --text:#e6e8ec; --muted:#9aa3b2; --accent:#4a72f0; --err:#ef6b6b; --ok:#66bb6a; color-scheme:dark; }
+  :root { --bg:#f4f5f7; --card:#fff; --head:#f9fafb; --line:#dde1e6; --text:#1f2933; --muted:#6b7480; --accent:#2f5bea; --err:#c62828; --ok:#2e7d32; color-scheme:light;
+          --c1:#2f5bea; --c2:#e8590c; --c3:#2b8a3e; --c4:#c2255c; --c5:#7048e8; --c6:#0c8599; --c7:#e67700; --c8:#5c7080; }
+  :root[data-theme=dark] { --bg:#15171c; --card:#1e2128; --head:#262a33; --line:#343945; --text:#e6e8ec; --muted:#9aa3b2; --accent:#4a72f0; --err:#ef6b6b; --ok:#66bb6a; color-scheme:dark;
+          --c1:#5b8cff; --c2:#ff922b; --c3:#51cf66; --c4:#f06595; --c5:#9775fa; --c6:#3bc9db; --c7:#fcc419; --c8:#adb5bd; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
   .layout { display:grid; grid-template-columns:var(--panel, 340px) 16px 1fr; padding:16px; min-height:100vh; }
@@ -57,8 +59,11 @@
   .hidden { display:none; }
   #flat { margin-top:6px; }
   #flat .row { align-items:center; margin-bottom:2px; }
-  #flat-list label { display:block; white-space:nowrap; }
-  #flat-list input { width:auto; }
+  #flat-list label, .checks label { display:block; white-space:nowrap; }
+  #flat-list input, .checks input { width:auto; }
+  #scols-box { margin-bottom:6px; }
+  #scols-box summary { cursor:pointer; }
+  #scols-box .row { align-items:center; margin:4px 0 2px; }
   /* 조건 입력 방식: 칸으로 선택(.fields)이면 한 줄 입력칸과 형식 안내를, 한 줄 입력(.line)이면 칸들을 감춘다. 조건 목록은 둘 다 같이 쓴다. */
   #cond.fields :is(#conditions .row, .format), #cond.line #builder { display:none; }
   #builder .row select { flex:1; min-width:0; }
@@ -76,7 +81,8 @@
   td.num { text-align:right; font-variant-numeric:tabular-nums; }
   /* 고르는 칸은 남는 너비를 고르게 나눠 갖고(최소 120px), 카드가 좁으면 다음 줄로 넘어간다. 버튼은 제 너비를 지킨다. */
   .chart-controls { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
-  .chart-controls select { flex:1 1 120px; }
+  .chart-controls select, .chart-controls input { flex:1 1 120px; }
+  .chart-controls .hint { align-self:center; margin:0; white-space:nowrap; }
   /* 높이(--chart, 기본 400px)를 기준으로 비율(--ratio = 가로/세로)만큼 넓어진다. 카드보다 넓어지면 카드 너비에 맞춰 줄어든다. */
   .chart-box { width:min(100%, calc(var(--chart, 400px) * var(--ratio, 16 / 9))); aspect-ratio:var(--ratio, 16 / 9); margin:0 auto; }
   .row.save select { width:auto; }
@@ -183,25 +189,48 @@
     <section class="card">
       <h3>집계</h3>
       <div class="row"><button id="summarize">집계 계산</button></div>
+      <details id="scols-box">
+        <summary class="hint" id="scols-count"></summary>
+        <div class="row"><button class="ghost" id="scols-all">모두 선택</button><button class="ghost" id="scols-none">모두 해제</button></div>
+        <div class="cols checks" id="scols"></div>
+      </details>
       <div class="err" id="err-summary"></div>
       <div class="table-wrap" id="summary"></div>
+      <div class="row save"><span class="hint">집계 표 저장</span>
+        <select id="simage" title="저장할 그림의 모드 (차트 저장과 같이 바뀝니다)"><option value="light">라이트</option><option value="dark">다크</option></select>
+        <button data-table="png">PNG</button><button data-table="jpeg">JPG</button></div>
       <div class="grip-y" data-size="summary" title="끌어서 집계 표 높이 조절 (더블클릭: 기본)"></div>
     </section>
     <section class="card">
       <h3>차트</h3>
       <div class="chart-controls">
         <select id="cx" title="X 컬럼"></select>
-        <select id="cy" title="Y 컬럼 (개수일 때는 비워 둡니다)"></select>
-        <select id="cagg"><option value="count">개수</option><option value="sum">합계</option><option value="mean">평균</option></select>
-        <select id="ctype"><option value="bar">막대</option><option value="line">선</option></select>
+        <select id="csplit" title="이 컬럼의 값마다 계열을 나눕니다 (최대 8개)"></select>
         <select id="corder" title="그룹 순서"><option value="x">X 순</option><option value="value">값 큰 순</option></select>
         <select id="cratio" title="차트 비율"><option value="auto">비율 자동</option><option value="square">1:1</option><option value="wide">16:9</option></select>
         <button id="draw">그리기</button>
       </div>
+      <div class="chart-controls">
+        <select id="cy" title="Y 컬럼 (개수일 때는 비워 둡니다)"></select>
+        <select id="cagg" title="집계 방식"><option value="count">개수</option><option value="sum">합계</option><option value="mean">평균</option></select>
+        <select id="ctype" title="계열 종류"><option value="bar">막대</option><option value="line">선</option></select>
+        <select id="cdash" title="선 모양" disabled><option value="solid">실선</option><option value="dashed">점선</option></select>
+        <select id="caxis" title="이 계열이 쓸 세로축"><option value="left">왼쪽 축</option><option value="right">오른쪽 축</option></select>
+        <button id="series-add" title="지금 고른 Y·집계·종류·선 모양·축을 계열로 넣습니다. 넣은 계열들이 한 차트에 겹쳐 그려집니다.">계열 추가</button>
+      </div>
+      <ul class="items" id="series"></ul>
+      <div class="chart-controls">
+        <span class="hint">왼쪽 축</span>
+        <input id="ymin" type="number" step="any" placeholder="최소 (자동)" title="왼쪽 세로축의 가장 작은 값. 비우면 자동">
+        <input id="ymax" type="number" step="any" placeholder="최대 (자동)" title="왼쪽 세로축의 가장 큰 값. 비우면 자동">
+        <span class="hint">오른쪽 축</span>
+        <input id="y1min" type="number" step="any" placeholder="최소 (자동)" title="오른쪽 세로축의 가장 작은 값. 비우면 자동">
+        <input id="y1max" type="number" step="any" placeholder="최대 (자동)" title="오른쪽 세로축의 가장 큰 값. 비우면 자동">
+      </div>
       <div class="err" id="err-chart"></div>
       <div class="chart-box"><canvas id="chart"></canvas></div>
       <div class="row save"><span class="hint">차트 저장</span>
-        <select id="cimage" title="저장할 그림의 모드"><option value="light">라이트</option><option value="dark">다크</option></select>
+        <select id="cimage" title="저장할 그림의 모드 (집계 표 저장과 같이 바뀝니다)"><option value="light">라이트</option><option value="dark">다크</option></select>
         <button data-image="png">PNG</button><button data-image="jpeg">JPG</button></div>
       <div class="grip-y" data-size="chart" title="끌어서 차트 높이 조절 (더블클릭: 기본)"></div>
     </section>
@@ -259,6 +288,29 @@ document.querySelectorAll("input[name=kind]").forEach(r => r.onchange = () => {
   $("folder-box").classList.toggle("hidden", !folder);
   $("url-box").classList.toggle("hidden", folder);
 });
+// 체크 목록: box 안에 값마다 체크 칸을 만든다. keep에 든 값은 체크해 둔다. checked(box)는 체크한 값들.
+function checks(box, values, keep = []) {
+  box.replaceChildren(...values.map(v => {
+    const label = document.createElement("label"), input = Object.assign(document.createElement("input"), { type: "checkbox", value: v, checked: keep.includes(v) });
+    label.append(input, " " + v);
+    return label;
+  }));
+}
+function checked(box) { return [...box.querySelectorAll("input:checked")].map(i => i.value); }
+// 집계할 컬럼: 고르지 않으면 전체(표시 컬럼을 정했으면 그 컬럼들), 고르면 그 컬럼만 집계한다. 컬럼 목록이 바뀌어도 고른 것은 남긴다.
+function showSummaryCols() {
+  const n = checked($("scols")).length;
+  $("scols-count").textContent = n ? `집계할 컬럼: ${n} / ${S.cols.length}개 선택` : "집계할 컬럼: 전체";
+}
+function fillSummaryCols() {
+  checks($("scols"), S.cols.map(c => c[0]), checked($("scols")));
+  showSummaryCols();
+}
+$("scols").onchange = showSummaryCols;
+$("scols-all").onclick = () => { $("scols").querySelectorAll("input").forEach(i => i.checked = true); showSummaryCols(); };
+$("scols-none").onclick = () => { $("scols").querySelectorAll("input").forEach(i => i.checked = false); showSummaryCols(); };
+showSummaryCols();
+
 // Parquet·CSV는 여러 개를 골라 연다(파일마다 테이블 하나). 파일 목록에서 이 항목을 고르면 체크 목록이 나온다.
 const FLAT = "*flat";  // 파일 이름에 쓸 수 없는 글자로 시작해 실제 경로와 겹치지 않는다.
 const flatBoxes = () => [...document.querySelectorAll("#flat-list input")];
@@ -276,9 +328,12 @@ function clearScreen() {
   S.cols = [];
   LISTS.forEach(k => { S[k] = []; renderList(k); });
   $("cols").innerHTML = "";
-  ["cx", "cy", "bcol"].forEach(id => fill($(id), []));
+  ["cx", "cy", "csplit", "bcol"].forEach(id => fill($(id), []));
+  series = [];
+  showSeries();
   $("bpick").classList.add("hidden");
   showBuilder();
+  fillSummaryCols();
   last = drawn = null;
   if (chart) chart.destroy();
   chart = null;
@@ -307,11 +362,7 @@ $("find").onclick = () => busy($("find"), async () => {
     const d = await api("/api/files", { path: $("path").value });
     fill($("file"), d.files);
     if (d.flat.length) $("file").append(new Option(`Parquet·CSV 파일 고르기 (${d.flat.length}개)`, FLAT));
-    $("flat-list").replaceChildren(...d.flat.map(f => {  // 처음에는 아무것도 고르지 않은 상태. 쓸 파일만 체크한다.
-      const label = document.createElement("label"), box = Object.assign(document.createElement("input"), { type: "checkbox", value: f });
-      label.append(box, " " + f);
-      return label;
-    }));
+    checks($("flat-list"), d.flat);  // 처음에는 아무것도 고르지 않은 상태. 쓸 파일만 체크한다.
     $("file").classList.remove("hidden");
     showFlat();
     connMsg("");
@@ -353,10 +404,14 @@ async function refreshColumns() {
   $("cols").innerHTML = S.cols.map(([n, t]) => `${esc(n)} (${esc(t)})`).join("<br>");
   fill($("cx"), S.cols.map(c => c[0]));
   fill($("cy"), S.cols.filter(c => c[1] === "정수" || c[1] === "실수").map(c => c[0]), "Y 없음");
+  const split = $("csplit").value;  // 나눌 컬럼도 고른 것은 남아 있으면 그대로 둔다.
+  fill($("csplit"), S.cols.map(c => c[0]), "나누지 않음");
+  if (S.cols.some(c => c[0] === split)) $("csplit").value = split;
   const col = $("bcol").value;  // 조건 칸의 컬럼 목록도 새로 채우되, 고른 컬럼은 남아 있으면 그대로 둔다.
   fill($("bcol"), S.cols.map(c => c[0]));
   if (S.cols.some(c => c[0] === col)) $("bcol").value = col; else $("bpick").classList.add("hidden");
   showBuilder();
+  fillSummaryCols();
 }
 
 // 3~7. 조인·기간·조건·정렬·표시 컬럼: 한 줄 입력 → 서버에서 검사 → 목록에 추가
@@ -453,12 +508,16 @@ showBuilder();
 
 // 8. 검색
 // 문자열을 최대 글자 수까지만 보여 주고, 잘린 값은 마우스를 올리면 전체가 보인다.
-function cell(v) {
-  if (typeof v === "number") return `<td class="num">${v.toLocaleString()}</td>`;
+// 값이 표에 보이는 글자와 전체 글자. 숫자는 자릿수 쉼표를 넣고, 문자열은 최대 글자 수에서 자른다.
+function shown(v) {
+  if (typeof v === "number") return [v.toLocaleString(), ""];
   const s = String(v ?? ""), max = +$("maxlen").value;
-  return max > 0 && s.length > max
-    ? `<td title="${esc(s).replace(/"/g, "&quot;")}">${esc(s.slice(0, max))}…</td>`
-    : `<td>${esc(s)}</td>`;
+  return max > 0 && s.length > max ? [s.slice(0, max) + "…", s] : [s, ""];
+}
+function cell(v) {
+  const [text, full] = shown(v);
+  return typeof v === "number" ? `<td class="num">${text}</td>`
+    : full ? `<td title="${esc(full).replace(/"/g, "&quot;")}">${esc(text)}</td>` : `<td>${esc(text)}</td>`;
 }
 function table(data) {
   if (!data.rows.length) return '<span class="empty">결과가 없습니다.</span>';
@@ -485,7 +544,7 @@ $("summarize").onclick = () => {
   return busy($("summarize"), async () => {
     const before = last;
     try {
-      const { summary } = await api("/api/summary", state());
+      const { summary } = await api("/api/summary", { ...state(), summary_columns: checked($("scols")) });
       if (last !== before) return;  // 계산하는 사이 새로 검색했으면 버린다.
       last = { ...last, summary };
       renderTables();
@@ -522,18 +581,54 @@ function themeColors(theme) {
   const root = document.documentElement, now = root.dataset.theme;
   root.dataset.theme = theme;
   const css = getComputedStyle(root), color = name => css.getPropertyValue(name).trim();
-  const colors = { card: color("--card"), bar: color("--accent"), text: color("--muted"), line: color("--line") };
+  const colors = { card: color("--card"), head: color("--head"), ink: color("--text"), text: color("--muted"), line: color("--line"),
+                   series: [1, 2, 3, 4, 5, 6, 7, 8].map(i => color("--c" + i)) };  // 계열 색. 넣은 순서대로 쓰고, 넘치면 처음부터 다시 쓴다.
   root.dataset.theme = now;
   return colors;
 }
+// 세로축 범위: 넣은 쪽만 고정하고 비운 쪽은 자동. 최소가 최대보다 작지 않으면 그 축은 자동으로 두고 이유를 알린다.
+function axisRange(lo, hi) {
+  const min = $(lo).value, max = $(hi).value;
+  if (min !== "" && max !== "" && +min >= +max) return {};
+  return { ...(min !== "" ? { min: +min } : {}), ...(max !== "" ? { max: +max } : {}) };
+}
+const rangeError = () => [["ymin", "ymax", "왼쪽"], ["y1min", "y1max", "오른쪽"]]
+  .filter(([lo, hi]) => $(lo).value !== "" && $(hi).value !== "" && +$(lo).value >= +$(hi).value)
+  .map(([, , side]) => `${side} 축의 최소는 최대보다 작아야 합니다.`).join(" ");
+["ymin", "ymax", "y1min", "y1max"].forEach(id => $(id).oninput = () => { $("err-chart").textContent = rangeError(); drawChart(); });  // 다시 조회하지 않고 바로 반영
 function chartConfig(colors, options = {}) {
   const axis = { ticks: { color: colors.text }, grid: { color: colors.line } };
+  const right = drawn.datasets.some(d => d.axis === "right");
   return {
-    type: drawn.type,
-    data: { labels: drawn.labels, datasets: [{ label: drawn.label, data: drawn.values, backgroundColor: colors.bar, borderColor: colors.bar }] },
-    options: { maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: axis, y: axis }, ...options },
+    type: "bar",
+    data: { labels: drawn.labels, datasets: drawn.datasets.map((d, i) => {
+      const color = colors.series[i % colors.series.length];
+      return { type: d.type, label: d.label, data: d.values, yAxisID: d.axis === "right" ? "y1" : "y", backgroundColor: color, borderColor: color,
+               borderDash: d.dash === "dashed" ? [6, 4] : [], borderWidth: d.type === "line" ? 2 : 0, pointRadius: 2, spanGaps: true, order: d.type === "line" ? 0 : 1 };
+    }) },
+    options: { maintainAspectRatio: false, plugins: { legend: { display: drawn.datasets.length > 1, labels: { color: colors.text } } },
+               scales: { x: axis, y: { ...axis, ...axisRange("ymin", "ymax") },
+                         ...(right ? { y1: { ...axis, position: "right", grid: { drawOnChartArea: false }, ...axisRange("y1min", "y1max") } } : {}) }, ...options },
   };
 }
+// 계열: 차트에 겹쳐 그릴 값 하나하나. 넣어 둔 것이 없으면 지금 고른 칸의 내용이 계열 하나가 된다.
+let series = [];
+const AGGS = { count: "개수", sum: "합계", mean: "평균" };
+const seriesNow = () => ({ y: $("cy").value, agg: $("cagg").value, type: $("ctype").value, dash: $("cdash").value, axis: $("caxis").value });
+const seriesName = s => AGGS[s.agg] + (s.agg === "count" ? "" : ` (${s.y})`);
+function showSeries() {
+  $("series").innerHTML = series.map((s, i) => `<li><span>${esc(seriesName(s))} <span class="hint">· ${s.type === "bar" ? "막대" : s.dash === "dashed" ? "점선" : "선"} · ${s.axis === "right" ? "오른쪽 축" : "왼쪽 축"}</span></span>` +
+    `<button class="ghost" data-series="${i}">×</button></li>`).join("");
+  $("series").querySelectorAll("button").forEach(b => b.onclick = () => { series.splice(+b.dataset.series, 1); showSeries(); });
+}
+$("series-add").onclick = () => {
+  const s = seriesNow();
+  if (s.agg !== "count" && !s.y) { $("err-chart").textContent = "합계·평균은 Y 컬럼을 고르세요."; return; }
+  series.push(s);
+  $("err-chart").textContent = "";
+  showSeries();
+};
+$("ctype").onchange = () => { $("cdash").disabled = $("ctype").value === "bar"; };  // 막대에는 선 모양이 없다.
 // 차트 비율(가로/세로). 자동이면 그룹이 5개 이하일 때 1:1, 늘수록 넓어져 25개 이상이면 16:9.
 const RATIOS = { square: 1, wide: 16 / 9 };
 function fitChart() {
@@ -549,14 +644,50 @@ function drawChart() {
 }
 $("draw").onclick = () => busy($("draw"), async () => {
   try {
-    const body = { ...state(), x: $("cx").value, y: $("cy").value, agg: $("cagg").value, order: $("corder").value };
-    const d = await api("/api/chart", body);
-    const label = $("cagg").selectedOptions[0].text + (body.agg === "count" ? "" : ` (${body.y})`);
-    drawn = { type: $("ctype").value, labels: d.labels, values: d.values, label };
+    const used = series.length ? series : [seriesNow()], split = $("csplit").value;
+    const d = await api("/api/chart", { ...state(), x: $("cx").value, split, order: $("corder").value, series: used.map(s => ({ y: s.y, agg: s.agg })) });
+    // 계열 이름: 나누지 않으면 계열 이름, 나누면 나눈 값(계열이 여럿이면 "계열 · 값").
+    const label = k => !split ? seriesName(used[k.series]) : used.length > 1 ? `${seriesName(used[k.series])} · ${k.split}` : k.split;
+    drawn = { labels: d.labels, datasets: d.datasets.map(k => ({ ...used[k.series], label: label(k), values: k.values })) };
     drawChart();
-    $("err-chart").textContent = d.labels.length === d.max_groups ? `그룹이 많아 ${d.max_groups}개만 표시합니다.` : "";
+    $("err-chart").textContent = [rangeError(), d.labels.length === d.max_groups ? `그룹이 많아 ${d.max_groups}개만 표시합니다.` : "",
+      d.more_splits ? `나눌 값이 많아 행이 많은 ${d.max_splits}개만 표시합니다.` : ""].filter(Boolean).join(" ");
   } catch (e) { $("err-chart").textContent = e.message; }
 });
+// 집계 표 내보내기: 표 전체를 고른 저장 모드의 색으로 그려 저장한다. 글자는 화면의 표와 같게 보인다(글자 수 제한 포함).
+document.querySelectorAll("[data-table]").forEach(b => b.onclick = () => {
+  if (!last?.summary) { $("err-summary").textContent = "먼저 집계를 계산하세요."; return; }
+  const { columns, rows } = last.summary, colors = themeColors($("simage").value);
+  const cells = [columns.map(c => [c, false]), ...rows.map(r => columns.map(c => [shown(r[c])[0], typeof r[c] === "number"]))];
+  const scale = 2, edge = 12, pad = 10, height = 26, font = bold => `${bold ? "600 " : ""}12px system-ui, "Malgun Gothic", sans-serif`;
+  const out = document.createElement("canvas"), ctx = out.getContext("2d");
+  const widths = columns.map((_, j) => Math.max(...cells.map((row, i) => { ctx.font = font(!i); return Math.ceil(ctx.measureText(row[j][0]).width); })) + pad * 2);
+  const width = widths.reduce((a, b) => a + b, 0);
+  out.width = (width + edge * 2) * scale;
+  out.height = (cells.length * height + edge * 2) * scale;
+  ctx.scale(scale, scale);
+  ctx.fillStyle = colors.card;
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.fillStyle = colors.head;
+  ctx.fillRect(edge, edge, width, height);
+  ctx.textBaseline = "middle";
+  cells.forEach((row, i) => {
+    const y = edge + i * height;
+    let x = edge;
+    row.forEach(([text, number], j) => {
+      ctx.font = font(!i);
+      ctx.fillStyle = colors.ink;
+      ctx.textAlign = number ? "right" : "left";
+      ctx.fillText(text, number ? x + widths[j] - pad : x + pad, y + height / 2);
+      x += widths[j];
+    });
+    ctx.fillStyle = colors.line;
+    ctx.fillRect(edge, y + height - 1, width, 1);
+  });
+  download(out.toDataURL("image/" + b.dataset.table), "summary." + (b.dataset.table === "jpeg" ? "jpg" : "png"));
+  $("err-summary").textContent = "";
+});
+
 // 차트 내보내기: 고른 저장 모드(화면 모드와 무관)의 색으로 화면과 같은 크기에 다시 그려, 그 모드의 배경 위에 옮겨 저장한다.
 document.querySelectorAll("[data-image]").forEach(b => b.onclick = () => {
   if (!chart) { $("err-chart").textContent = "먼저 차트를 그리세요."; return; }
@@ -585,9 +716,10 @@ $("theme").onclick = () => {
   saveSetting({ theme });
 };
 $("cratio").onchange = () => { fitChart(); saveSetting({ ratio: $("cratio").value }); };
-$("cimage").onchange = () => saveSetting({ image: $("cimage").value });
+// 그림 모드는 차트 저장과 집계 표 저장이 함께 쓴다. 한쪽에서 바꾸면 다른 쪽도 바뀐다.
+$("cimage").onchange = $("simage").onchange = e => { $("cimage").value = $("simage").value = e.target.value; saveSetting({ image: e.target.value }); };
 $("cratio").value = saved("ratio") || "auto";
-$("cimage").value = saved("image") || "light";
+$("cimage").value = $("simage").value = saved("image") || "light";
 $("quotes").checked = saved("quotes") !== "off";
 showCondMode(saved("cond") || "fields");
 $("quotes").onchange = () => saveSetting({ quotes: $("quotes").checked ? "on" : "off" });

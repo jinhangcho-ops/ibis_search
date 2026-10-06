@@ -1,10 +1,12 @@
 """결과 계산과 파일 저장. 이 단계에서 처음으로 연산이 실행된다."""
+from decimal import Decimal
 from pathlib import Path
 
 from parse import check_name, type_info
 
 SUMMARY_COLS = ["name", "type", "count", "nulls", "unique", "min", "max", "mean"]
 MAX_GROUPS = 50  # 차트에 표시할 최대 그룹 수
+MAX_SPLITS = 8  # 차트에서 한 컬럼의 값별로 나눌 때 최대 값 개수
 MAX_VALUES = 200  # 조건을 만들 때 보여 줄 컬럼 값 목록의 최대 개수
 EXCEL_MAX_ROWS = 1_048_575  # Excel 시트 한 장의 행 수(제목 줄 제외)
 
@@ -36,8 +38,27 @@ def get_count(expr):
     return expr.count().to_pyarrow().as_py()
 
 
-def get_summary(expr):
-    return expr.describe().to_polars().sort("pos").select(SUMMARY_COLS)
+def get_summary(expr, columns=()):
+    """컬럼별 집계를 조회 한 번으로 계산해 SUMMARY_COLS 모양의 줄들로 돌려준다. columns를 주면 그 컬럼만 그 순서로.
+    개수(빈 값 제외)·빈 값·고유값은 모든 컬럼, 최소·최대는 숫자와 날짜, 평균은 숫자만 계산한다."""
+    for column in columns:
+        check_name(column, expr.columns)
+    if columns:
+        expr = expr.select(list(columns))
+    kinds = {name: (t.is_numeric() or t.is_temporal(), t.is_numeric()) for name, t in expr.schema().items()}
+    metrics = {}
+    for i, (name, (ordered, numeric)) in enumerate(kinds.items()):
+        col = expr[name]
+        metrics.update({f"count{i}": col.count(), f"nulls{i}": col.isnull().sum(), f"unique{i}": col.nunique()})
+        if ordered:
+            metrics.update({f"min{i}": col.min(), f"max{i}": col.max()})
+        if numeric:
+            metrics[f"mean{i}"] = col.mean()
+    found = expr.aggregate(**metrics).to_polars().row(0, named=True)
+    plain = lambda v: v if v is None or isinstance(v, (int, float)) else float(v) if isinstance(v, Decimal) else str(v)
+    return [{"name": name, "type": str(expr.schema()[name]).lstrip("!"), "count": found[f"count{i}"], "nulls": found[f"nulls{i}"] or 0,
+             "unique": found[f"unique{i}"], **{k: plain(found.get(f"{k}{i}")) for k in ("min", "max", "mean")}}
+            for i, name in enumerate(kinds)]
 
 
 def get_values(expr, column, limit=MAX_VALUES):
@@ -48,19 +69,42 @@ def get_values(expr, column, limit=MAX_VALUES):
     return values[:limit], len(values) > limit
 
 
-def get_chart(expr, x, y, agg, order="x", max_groups=MAX_GROUPS):
-    """x별로 y를 집계한다(count는 y 없이 행 수). order가 "x"면 x 순, "value"면 값이 큰 순으로 최대 max_groups개."""
+def chart_metric(expr, y, agg):
+    """계열 하나의 집계 식. count는 y 없이 행 수, sum·mean은 숫자 컬럼 y가 있어야 한다."""
     if agg == "count":
-        value = expr.count()
-    elif agg not in ("sum", "mean"):
+        return expr.count()
+    if agg not in ("sum", "mean"):
         raise ValueError("집계 방식은 count, sum, mean 중 하나입니다.")
-    else:
-        if y not in expr.columns or not expr[y].type().is_numeric():
-            raise ValueError("합계·평균은 숫자 컬럼을 Y로 골라야 합니다.")
-        value = getattr(expr[y], agg)()
-    grouped = expr.group_by(x).aggregate(value=value)
-    keys = [grouped.value.desc(), grouped[x]] if order == "value" else [grouped[x]]
-    return grouped.order_by(keys).limit(max_groups).to_polars()
+    if y not in expr.columns or not expr[y].type().is_numeric():
+        raise ValueError("합계·평균은 숫자 컬럼을 Y로 골라야 합니다.")
+    return getattr(expr[y], agg)()
+
+
+def get_chart(expr, x, series, split=None, order="x"):
+    """x별로 계열들을 집계한다. series는 [{"y", "agg"}]. order가 "x"면 x 순, "value"면 첫 계열 값이 큰 순으로 최대 MAX_GROUPS개.
+    split을 주면 그 컬럼의 값마다(행이 많은 순으로 최대 MAX_SPLITS개) 계열을 나눈다.
+    (x 값들, [{"series": 계열 번호, "split": 나눈 값 또는 None, "values": x 값 순서의 값들}], 나눈 값이 더 있는지)를 돌려준다."""
+    check_name(x, expr.columns)
+    if not series:
+        raise ValueError("계열을 하나 이상 넣으세요.")
+    # 집계 식은 집계할 그 테이블 식에서 만들어야 한다(행 수는 다른 식에서 만든 것을 쓸 수 없다).
+    metrics = lambda table: {f"v{i}": chart_metric(table, s.get("y"), s.get("agg")) for i, s in enumerate(series)}
+    top = expr.group_by(x).aggregate(**metrics(expr))
+    top = top.order_by([top.v0.desc(), top[x]] if order == "value" else [top[x]]).limit(MAX_GROUPS).to_polars()
+    labels = top[x].to_list()
+    if not split:
+        return labels, [{"series": i, "split": None, "values": top[f"v{i}"].to_list()} for i in range(len(series))], False
+    check_name(split, expr.columns)
+    filled = expr.filter(expr[split].notnull())
+    sizes = filled.group_by(split).aggregate(n=filled.count())
+    parts = sizes.order_by([sizes.n.desc(), sizes[split]]).limit(MAX_SPLITS + 1).to_polars()[split].to_list()
+    more, parts = len(parts) > MAX_SPLITS, parts[:MAX_SPLITS]
+    known = [v for v in labels if v is not None]
+    inside = expr.filter(expr[x].isin(known), expr[split].isin(parts))
+    cells = inside.group_by([x, split]).aggregate(**metrics(inside)).to_polars()
+    found = {(row[x], row[split]): row for row in cells.iter_rows(named=True)}
+    return labels, [{"series": i, "split": str(part), "values": [found.get((label, part), {}).get(f"v{i}") for label in labels]}
+                    for i in range(len(series)) for part in parts], more
 
 
 def export(expr, path):
