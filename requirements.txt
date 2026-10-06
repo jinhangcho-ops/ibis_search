@@ -3,3 +3,4 @@ polars
 flask
 pywebview
 xlsxwriter
+psutil

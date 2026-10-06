@@ -1,4 +1,4 @@
-"""사용자 설정(화면 모드, 차트 비율, 차트 저장 모드, 따옴표 해석, 끌어서 조절한 크기)을 사용자 폴더의 파일에 저장해 다음 실행 때도 쓴다."""
+"""사용자 설정(화면 모드, 차트 비율, 차트 저장 모드, 따옴표 해석, 끌어서 조절한 크기, 직전 실행의 행당 시간)을 사용자 폴더의 파일에 저장해 다음 실행 때도 쓴다."""
 import json
 import os
 from pathlib import Path
@@ -18,7 +18,14 @@ CHOICES = {
 SIZES = {"panel": (240, 640), "rows": (120, 1200), "summary": (120, 1200), "chart": (200, 1000)}
 
 
+# 직전 실행의 행당 시간(나노초/행). 작업 종류(검색·집계·차트·저장)마다 하나. 화면이 예상 시간을 구할 때 쓴다.
+TIMES = ["time_search", "time_summary", "time_chart", "time_export"]
+MAX_TIME = 10**12
+
+
 def valid(name, value):
+    if name in TIMES:
+        return type(value) is int and 1 <= value <= MAX_TIME
     if name in SIZES:
         return type(value) is int and SIZES[name][0] <= value <= SIZES[name][1]
     return value in CHOICES.get(name, [])

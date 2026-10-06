@@ -7,7 +7,7 @@ from werkzeug.serving import make_server
 
 from app import KEY, app
 
-server = make_server("127.0.0.1", 0, app)  # 0: 비어 있는 포트를 자동으로 고른다.
+server = make_server("127.0.0.1", 0, app, threaded=True)  # 0: 비어 있는 포트를 자동으로 고른다. threaded: 조회 중에도 메모리·CPU 요청에 답한다.
 threading.Thread(target=server.serve_forever, daemon=True).start()
 
 webview.settings["ALLOW_DOWNLOADS"] = True  # 결과·차트 내보내기

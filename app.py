@@ -5,18 +5,21 @@ import operator
 import secrets
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
-from flask import Flask, Response, abort, jsonify, request
+from flask import Flask, Response, abort, g, jsonify, request
 from werkzeug.exceptions import HTTPException
 
+import monitor
 import parse
 import result
 import settings
 import source
 
 app = Flask(__name__, static_folder="static")
-state = {"con": None, "password": "", "opened": None}  # 연결은 메모리에만 둔다. opened는 다시 열 때 쓸 요청 값.
+state = {"con": None, "password": "", "opened": None, "rows": {}}  # 연결은 메모리에만 둔다. opened는 다시 열 때 쓸 요청 값. rows는 세어 둔 테이블 행 수.
+turn = threading.Lock()  # 연결 하나를 같이 쓰므로 요청은 한 번에 하나만 처리한다. 메모리·CPU 요청만 기다리지 않는다.
 KEY = secrets.token_urlsafe(32)  # 실행할 때마다 새로 만드는 열쇠. desktop.py가 창 주소에 넣는다.
 
 
@@ -76,6 +79,33 @@ def only_window():
         abort(403, "프로그램 창에서만 열 수 있습니다.")
 
 
+@app.before_request
+def wait_turn():
+    if request.path != "/api/usage":
+        turn.acquire()
+        g.turn = True
+
+
+@app.teardown_request
+def end_turn(error):
+    if g.pop("turn", False):
+        turn.release()
+
+
+@app.get("/api/usage")
+def usage():
+    return jsonify(monitor.usage())
+
+
+@app.post("/api/rowcount")
+def rowcount():
+    """기준 테이블의 전체 행 수. 예상 시간을 구할 때 쓴다. 테이블마다 한 번만 세고 연결이 바뀔 때까지 기억한다."""
+    schema, base = request.json.get("schema") or None, request.json["base"]
+    if (schema, base) not in state["rows"]:
+        state["rows"][schema, base] = result.get_count(source.get_table(get_con(), base, schema))
+    return jsonify(rows=state["rows"][schema, base])
+
+
 @app.get("/")
 def index():
     response = app.send_static_file("index.html")
@@ -124,6 +154,7 @@ def connect():
     if state["con"] is not None:  # 이전 연결을 닫아야 같은 파일을 다시 열 수 있다.
         source.close(state["con"])
         state.update(con=None, password="", opened=None)
+    state["rows"] = {}
     try:
         con = open_con(new)
     except Exception as e:
@@ -143,7 +174,7 @@ def disconnect():
     """연결을 끊고 파일·접속을 놓는다. 연결이 없으면 아무 일도 하지 않는다."""
     if state["con"] is not None:
         source.close(state["con"])
-    state.update(con=None, password="", opened=None)
+    state.update(con=None, password="", opened=None, rows={})
     return jsonify(ok=True)
 
 
