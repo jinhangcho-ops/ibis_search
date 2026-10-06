@@ -2,6 +2,8 @@
 from decimal import Decimal
 from pathlib import Path
 
+import ibis
+
 from parse import check_name, type_info
 
 SUMMARY_COLS = ["name", "type", "count", "nulls", "unique", "min", "max", "mean"]
@@ -30,8 +32,17 @@ def columns(expr):
     return [(name, type_info(dtype)[0]) for name, dtype in expr.schema().items()]
 
 
-def get_rows(expr, limit):
-    return expr.limit(limit).to_polars()
+def get_rows(expr, limit, offset=0):
+    """offset행을 건너뛰고 limit행."""
+    return expr.limit(limit, offset=offset).to_polars()
+
+
+def get_sql(expr, limit, offset=0):
+    """get_rows가 실행할 조회를 SQL 글로. 실행하지는 않는다. SQL을 쓰지 않는 연결(Parquet·CSV 파일)은 보여 줄 수 없다."""
+    try:
+        return str(ibis.to_sql(expr.limit(limit, offset=offset)))
+    except NotImplementedError:
+        raise ValueError("이 연결의 조회는 SQL로 보여 줄 수 없습니다.") from None
 
 
 def get_count(expr):
@@ -112,4 +123,7 @@ def export(expr, path):
     suffix = Path(path).suffix.lower()
     if suffix not in EXPORTS:
         raise ValueError(f"파일 이름은 {', '.join(EXPORTS)} 중 하나로 끝나야 합니다.")
+    if suffix != ".parquet":  # 수식으로 읽힐 글자로 시작하는 문자 값은 앞에 '를 붙여 스프레드시트가 실행하지 않게 한다.
+        texts = [name for name, t in expr.schema().items() if t.is_string()]
+        expr = expr.mutate(**{name: expr[name].re_search(r"^[=+\-@\t\r]").ifelse("'" + expr[name], expr[name]) for name in texts})
     EXPORTS[suffix](expr, path)

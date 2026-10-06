@@ -1,8 +1,9 @@
 """데이터 연결. 폴더의 파일을 열거나, 연결 주소로 DB에 접속한다."""
 import os
+import re
 import threading
 from pathlib import Path
-from urllib.parse import quote_plus, urlsplit
+from urllib.parse import quote_plus, unquote, urlsplit
 
 import ibis
 
@@ -56,30 +57,31 @@ def open_flat_files(paths):
 CONNECT_TIMEOUT = 60  # 주소로 접속할 때 기다리는 시간(초). 틀린 주소에서 드라이버가 몇 분씩 붙잡는 것을 막는다.
 
 
-def within(seconds, connect):
-    """connect()를 따로 돌려 seconds초까지만 기다린다. DB 종류와 상관없이 쓸 수 있게 드라이버 설정 대신 이렇게 한다.
-    포기한 뒤에 늦게 연결되면 그 연결은 닫는다."""
-    found, gave_up = {}, threading.Event()
+def within(seconds, work, late, wake=None, drop=lambda value: None):
+    """work()를 따로 돌려 seconds초까지만 기다린다. DB 종류와 상관없이 쓸 수 있게 드라이버 설정 대신 이렇게 한다.
+    넘기면 late 문구로 TimeoutError, 기다리는 중에 밖에서 wake를 켜면 InterruptedError를 낸다.
+    포기한 뒤에 늦게 나온 결과는 drop에 넘긴다(연결이면 닫는다)."""
+    found, gave_up, wake = {}, threading.Event(), wake or threading.Event()
 
     def run():
         try:
-            found["con"] = connect()
+            found["value"] = work()
         except Exception as e:
             found["error"] = e
-        if gave_up.is_set() and "con" in found:
-            close(found["con"])
+        if gave_up.is_set() and "value" in found:
+            drop(found["value"])
+        wake.set()
 
-    thread = threading.Thread(target=run, daemon=True)  # daemon: 기다리는 중에 프로그램을 꺼도 붙잡지 않는다.
-    thread.start()
-    thread.join(seconds)
-    if thread.is_alive():
+    threading.Thread(target=run, daemon=True).start()  # daemon: 기다리는 중에 프로그램을 꺼도 붙잡지 않는다.
+    timed_out = not wake.wait(seconds)
+    if not found:
         gave_up.set()
-        if "con" in found:  # 포기하는 순간에 연결된 경우
-            close(found["con"])
-        raise TimeoutError(f"{seconds}초 안에 연결되지 않았습니다. 주소와 네트워크를 확인하세요.")
+        if "value" in found:  # 포기하는 순간에 끝난 경우
+            drop(found["value"])
+        raise TimeoutError(late) if timed_out else InterruptedError()
     if "error" in found:
         raise found["error"]
-    return found["con"]
+    return found["value"]
 
 
 def open_url(url, user="", password=""):
@@ -90,13 +92,25 @@ def open_url(url, user="", password=""):
         parts = urlsplit(url)
         login = user + (":" + quote_plus(password, safe="") if password else "")
         url = parts._replace(netloc=f"{login}@{parts.netloc}").geturl()
-    return within(CONNECT_TIMEOUT, lambda: ibis.connect(url, **extra))
+    late = f"{CONNECT_TIMEOUT}초 안에 연결되지 않았습니다. 주소와 네트워크를 확인하세요."
+    return within(CONNECT_TIMEOUT, lambda: ibis.connect(url, **extra), late, drop=close)
 
 
 def close(con):
     """연결을 닫아 파일·접속을 놓는다. 닫기를 지원하지 않는 백엔드는 그냥 둔다."""
     try:
         con.disconnect()
+    except Exception:
+        pass
+
+
+def interrupt(con):
+    """연결이 돌리고 있는 작업을 멈추라고 드라이버에 알린다. 드라이버 연결(con.con)에 interrupt나 cancel이 있을 때만, 되는 만큼만 한다."""
+    raw = getattr(con, "con", None)
+    stop = getattr(raw, "interrupt", None) or getattr(raw, "cancel", None)
+    try:
+        if stop:
+            stop()
     except Exception:
         pass
 
@@ -114,8 +128,29 @@ def get_table(con, name, schema=None):
     return con.table(name, database=schema) if schema else con.table(name)
 
 
-def mask(message, password):
-    """메시지에서 비밀번호(원래 값과 주소에 넣은 인코딩 값)를 ***로 가린다."""
-    for secret in (quote_plus(password, safe=""), password) if password else ():
-        message = message.replace(secret, "***")
+def passwords(info):
+    """연결 요청에서 가릴 비밀번호들: 비밀번호 칸의 값, 주소 안에 쓴 값(쓴 그대로와 인코딩을 푼 값)."""
+    inside = urlsplit(info.get("url", "")).password or ""
+    return [info.get("password", ""), inside, unquote(inside)]
+
+
+def recent(info):
+    """연결 요청에서 다음 실행 때 칸을 채워 줄 값만. 비밀번호는 칸의 값도, 주소 안에 쓴 값도 남기지 않는다."""
+    if info["kind"] == "folder":
+        return {"kind": "folder", "path": info.get("path", "")}
+    parts = urlsplit(info["url"])
+    login, at, host = parts.netloc.rpartition("@")
+    url = parts._replace(netloc=login.partition(":")[0] + at + host).geturl() if parts.password else info["url"]
+    return {"kind": "url", "url": url, "user": info.get("user", "")}
+
+
+def mask(message, passwords):
+    """메시지에서 비밀번호(원래 값과 주소에 넣은 인코딩 값)를 ***로 가린다.
+    4자보다 짧은 비밀번호는 다른 글자까지 가리지 않게 주소의 비밀번호 자리(:와 @ 사이)에서만 가린다."""
+    for password in passwords:
+        for secret in (quote_plus(password, safe=""), password) if password else ():
+            if len(password) < 4:
+                message = re.sub("(?<=:)" + re.escape(secret) + "(?=@)", "***", message)
+            else:
+                message = message.replace(secret, "***")
     return message
