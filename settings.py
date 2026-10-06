@@ -1,4 +1,4 @@
-"""사용자 설정(화면 모드, 차트 비율, 차트 저장 모드, 따옴표 해석)을 사용자 폴더의 파일에 저장해 다음 실행 때도 쓴다."""
+"""사용자 설정(화면 모드, 차트 비율, 차트 저장 모드, 따옴표 해석, 끌어서 조절한 크기)을 사용자 폴더의 파일에 저장해 다음 실행 때도 쓴다."""
 import json
 import os
 from pathlib import Path
@@ -11,7 +11,17 @@ CHOICES = {
     "ratio": ["auto", "square", "wide"],  # 차트 비율: 데이터 양에 따라 / 1:1 / 16:9
     "image": ["light", "dark"],  # 차트 그림을 저장할 때의 모드
     "quotes": ["on", "off"],  # 조건을 넣을 때 따옴표 해석: 값을 감싸는 기호로 / 글자 그대로
+    "cond": ["fields", "line"],  # 조건 입력 방식: 칸으로 선택 / 한 줄 입력
 }
+
+# 끌어서 조절한 크기(px): (최소, 최대). 화면(index.html)의 SIZES와 같아야 한다. 0을 저장하면 기본 크기로 돌아간다.
+SIZES = {"panel": (240, 640), "rows": (120, 1200), "summary": (120, 1200), "chart": (200, 1000)}
+
+
+def valid(name, value):
+    if name in SIZES:
+        return type(value) is int and SIZES[name][0] <= value <= SIZES[name][1]
+    return value in CHOICES.get(name, [])
 
 
 def load():
@@ -22,7 +32,7 @@ def load():
         return {}
     if not isinstance(data, dict):
         return {}
-    return {name: data[name] for name, values in CHOICES.items() if data.get(name) in values}
+    return {name: value for name, value in data.items() if valid(name, value)}
 
 
 def save(changes):
@@ -30,7 +40,8 @@ def save(changes):
     if not isinstance(changes, dict) or not changes:
         raise ValueError("저장할 설정이 없습니다.")
     for name, value in changes.items():
-        if value not in CHOICES.get(name, []):
+        if not valid(name, value) and not (name in SIZES and value == 0 and type(value) is int):
             raise ValueError(f"'{name}' 설정에 쓸 수 없는 값입니다: {value}")
     PATH.parent.mkdir(parents=True, exist_ok=True)
-    PATH.write_text(json.dumps({**load(), **changes}), encoding="utf-8")
+    data = {name: value for name, value in {**load(), **changes}.items() if value != 0}
+    PATH.write_text(json.dumps(data), encoding="utf-8")

@@ -1,10 +1,11 @@
 """결과 계산과 파일 저장. 이 단계에서 처음으로 연산이 실행된다."""
 from pathlib import Path
 
-from parse import type_info
+from parse import check_name, type_info
 
 SUMMARY_COLS = ["name", "type", "count", "nulls", "unique", "min", "max", "mean"]
 MAX_GROUPS = 50  # 차트에 표시할 최대 그룹 수
+MAX_VALUES = 200  # 조건을 만들 때 보여 줄 컬럼 값 목록의 최대 개수
 EXCEL_MAX_ROWS = 1_048_575  # Excel 시트 한 장의 행 수(제목 줄 제외)
 
 
@@ -37,6 +38,14 @@ def get_count(expr):
 
 def get_summary(expr):
     return expr.describe().to_polars().sort("pos").select(SUMMARY_COLS)
+
+
+def get_values(expr, column, limit=MAX_VALUES):
+    """컬럼의 서로 다른 값(빈 값 제외)을 정렬해 limit개까지 문자로 돌려준다. 더 있으면 두 번째 값이 True."""
+    check_name(column, expr.columns)
+    values = expr.filter(expr[column].notnull()).select(column).distinct().order_by(column).limit(limit + 1)
+    values = [str(v) for v in values.to_polars()[column].to_list()]
+    return values[:limit], len(values) > limit
 
 
 def get_chart(expr, x, y, agg, order="x", max_groups=MAX_GROUPS):

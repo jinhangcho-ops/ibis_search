@@ -1,5 +1,7 @@
 """Ibis 검색 화면의 서버. 따로 실행하지 않고 desktop.py가 프로그램 창 안에서 띄운다."""
+import functools
 import json
+import operator
 import secrets
 import shutil
 import tempfile
@@ -29,6 +31,18 @@ def get_con():
     return state["con"]
 
 
+def predicate(cond, expr):
+    """조건 하나를 Ibis 식으로. 문자열, 따옴표 해석을 끈 {"line": ..., "quotes": False},
+    화면에서 or로 이은 묶음 {"any": [조건, ...]} 중 하나다. 묶음 안은 or, 조건끼리는 and."""
+    if isinstance(cond, str):
+        return parse.parse_condition(cond, expr)[1]
+    if "any" in cond:
+        if not cond["any"]:
+            raise ValueError("or로 묶을 조건이 없습니다.")
+        return functools.reduce(operator.or_, [predicate(c, expr) for c in cond["any"]])
+    return parse.parse_condition(cond["line"], expr, cond.get("quotes", True))[1]
+
+
 def build(body, select=True):
     """요청의 테이블·조인·기간·조건·정렬·표시 컬럼 줄을 Ibis 식 하나로 만든다.
     select=False면 줄은 모두 검사하되 표시 컬럼은 적용하지 않는다(컬럼 목록, 차트)."""
@@ -41,9 +55,7 @@ def build(body, select=True):
         get_table,
     )
     preds = [p for line in body.get("periods", []) for p in parse.parse_period(line, expr)[1]]
-    for cond in body.get("conditions", []):  # 줄 하나는 문자열이거나, 따옴표 해석을 끈 {"line": ..., "quotes": False}
-        line, quotes = (cond, True) if isinstance(cond, str) else (cond["line"], cond.get("quotes", True))
-        preds.append(parse.parse_condition(line, expr, quotes)[1])
+    preds += [predicate(cond, expr) for cond in body.get("conditions", [])]
     keys = [parse.parse_sort(line, expr)[1] for line in body.get("sorts", [])]
     cols = [c for line in body.get("columns", []) for c in parse.parse_columns(line, expr)[1]]
     return parse.apply(expr, preds, keys, cols if select else [])
@@ -69,7 +81,7 @@ def index():
     response = app.send_static_file("index.html")
     response.set_cookie("key", KEY, httponly=True, samesite="Strict")
     for name, value in settings.load().items():  # 저장된 설정을 쿠키로 알려 준다. 화면이 그리기 전에 읽는다.
-        response.set_cookie(name, value, samesite="Strict")
+        response.set_cookie(name, str(value), samesite="Strict")
     return response
 
 
@@ -128,6 +140,13 @@ def tables():
 @app.post("/api/columns")
 def columns():
     return jsonify(columns=result.columns(build(request.json, select=False)))
+
+
+@app.post("/api/values")
+def values():
+    """조건을 만들 때 고를 수 있게 컬럼의 값 목록을 돌려준다. 화면에서 [목록]을 누를 때만 부른다."""
+    found, more = result.get_values(build(request.json, select=False), request.json.get("column", ""))
+    return jsonify(values=found, more=more)
 
 
 @app.post("/api/query")
