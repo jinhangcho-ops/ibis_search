@@ -121,3 +121,7 @@ pip install 'ibis-framework[mssql]'      # [] 안은 DB 이름: oracle, clickhou
 | Spark, Flink | `pyspark://`, `flink://` | [Java](https://adoptium.net/). exe에는 포함되지 않아 소스로 실행할 때만 사용합니다 (`pip install 'ibis-framework[pyspark]'`) |
 
 MSSQL은 설치된 ODBC 드라이버 중 최신 버전을 자동으로 고릅니다. 다른 드라이버를 쓰려면 주소 끝에 `?driver=드라이버이름`을 붙입니다. 아이디·비밀번호를 모두 비우면 Windows 인증으로 접속합니다.
+
+## 라이선스
+
+MIT 라이선스로 배포합니다. 전문은 [LICENSE](LICENSE)에 있습니다. 함께 들어 있는 Chart.js(`static/chart.umd.min.js`)도 MIT 라이선스입니다.
