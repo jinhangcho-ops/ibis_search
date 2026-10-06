@@ -1,5 +1,6 @@
 """데이터 연결. 폴더의 파일을 열거나, 연결 주소로 DB에 접속한다."""
 import os
+import threading
 from pathlib import Path
 from urllib.parse import quote_plus, urlsplit
 
@@ -52,6 +53,35 @@ def open_flat_files(paths):
     return con
 
 
+CONNECT_TIMEOUT = 30  # 주소로 접속할 때 기다리는 시간(초). 틀린 주소에서 드라이버가 몇 분씩 붙잡는 것을 막는다.
+
+
+def within(seconds, connect):
+    """connect()를 따로 돌려 seconds초까지만 기다린다. DB 종류와 상관없이 쓸 수 있게 드라이버 설정 대신 이렇게 한다.
+    포기한 뒤에 늦게 연결되면 그 연결은 닫는다."""
+    found, gave_up = {}, threading.Event()
+
+    def run():
+        try:
+            found["con"] = connect()
+        except Exception as e:
+            found["error"] = e
+        if gave_up.is_set() and "con" in found:
+            close(found["con"])
+
+    thread = threading.Thread(target=run, daemon=True)  # daemon: 기다리는 중에 프로그램을 꺼도 붙잡지 않는다.
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        gave_up.set()
+        if "con" in found:  # 포기하는 순간에 연결된 경우
+            close(found["con"])
+        raise TimeoutError(f"{seconds}초 안에 연결되지 않았습니다. 주소와 네트워크를 확인하세요.")
+    if "error" in found:
+        raise found["error"]
+    return found["con"]
+
+
 def open_url(url, user="", password=""):
     """duckdb://, mssql://, postgres:// 등 Ibis가 지원하는 주소로 접속한다.
     드라이버를 먼저 확인하고, 아이디·비밀번호는 입력한 것만 주소에 넣는다(비밀번호 특수문자는 인코딩)."""
@@ -60,7 +90,7 @@ def open_url(url, user="", password=""):
         parts = urlsplit(url)
         login = user + (":" + quote_plus(password, safe="") if password else "")
         url = parts._replace(netloc=f"{login}@{parts.netloc}").geturl()
-    return ibis.connect(url, **extra)
+    return within(CONNECT_TIMEOUT, lambda: ibis.connect(url, **extra))
 
 
 def close(con):
