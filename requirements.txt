@@ -1,0 +1,5 @@
+ibis-framework[duckdb,polars]>=10
+polars
+flask
+pywebview
+xlsxwriter

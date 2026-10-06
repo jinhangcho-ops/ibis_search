@@ -1,0 +1,179 @@
+"""Ibis 검색 화면의 서버. 따로 실행하지 않고 desktop.py가 프로그램 창 안에서 띄운다."""
+import json
+import secrets
+import shutil
+import tempfile
+from pathlib import Path
+
+from flask import Flask, Response, abort, jsonify, request
+from werkzeug.exceptions import HTTPException
+
+import parse
+import result
+import settings
+import source
+
+app = Flask(__name__, static_folder="static")
+state = {"con": None, "password": "", "opened": None}  # 연결은 메모리에만 둔다. opened는 다시 열 때 쓸 요청 값.
+KEY = secrets.token_urlsafe(32)  # 실행할 때마다 새로 만드는 열쇠. desktop.py가 창 주소에 넣는다.
+
+
+def to_json(df):
+    """Polars DataFrame → {columns, rows}. 날짜는 ISO 문자열이 된다."""
+    return {"columns": df.columns, "rows": json.loads(df.write_json())}
+
+
+def get_con():
+    if state["con"] is None:
+        raise ValueError("먼저 연결하세요.")
+    return state["con"]
+
+
+def build(body, select=True):
+    """요청의 테이블·조인·기간·조건·정렬·표시 컬럼 줄을 Ibis 식 하나로 만든다.
+    select=False면 줄은 모두 검사하되 표시 컬럼은 적용하지 않는다(컬럼 목록, 차트)."""
+    con, schema = get_con(), body.get("schema") or None
+    tables = source.list_tables(con, schema)
+    get_table = lambda name: source.get_table(con, name, schema)
+    expr = parse.apply_joins(
+        get_table(body["base"]),
+        [parse.parse_join(line, tables) for line in body.get("joins", [])],
+        get_table,
+    )
+    preds = [p for line in body.get("periods", []) for p in parse.parse_period(line, expr)[1]]
+    for cond in body.get("conditions", []):  # 줄 하나는 문자열이거나, 따옴표 해석을 끈 {"line": ..., "quotes": False}
+        line, quotes = (cond, True) if isinstance(cond, str) else (cond["line"], cond.get("quotes", True))
+        preds.append(parse.parse_condition(line, expr, quotes)[1])
+    keys = [parse.parse_sort(line, expr)[1] for line in body.get("sorts", [])]
+    cols = [c for line in body.get("columns", []) for c in parse.parse_columns(line, expr)[1]]
+    return parse.apply(expr, preds, keys, cols if select else [])
+
+
+@app.errorhandler(Exception)
+def on_error(e):
+    if isinstance(e, HTTPException):  # 404, 405, 잘못된 JSON 등은 원래 상태 코드로
+        return jsonify(error=e.description), e.code
+    return jsonify(error=source.mask(str(e), state["password"])), 400
+
+
+@app.before_request
+def only_window():
+    """프로그램 창의 요청만 받는다. 창은 첫 주소의 key로 들어와 쿠키를 받고, 그 뒤로는 쿠키로 확인한다."""
+    given = request.args.get("key") or request.cookies.get("key", "")
+    if not secrets.compare_digest(given.encode(), KEY.encode()):
+        abort(403, "프로그램 창에서만 열 수 있습니다.")
+
+
+@app.get("/")
+def index():
+    response = app.send_static_file("index.html")
+    response.set_cookie("key", KEY, httponly=True, samesite="Strict")
+    for name, value in settings.load().items():  # 저장된 설정을 쿠키로 알려 준다. 화면이 그리기 전에 읽는다.
+        response.set_cookie(name, value, samesite="Strict")
+    return response
+
+
+@app.post("/api/settings")
+def save_settings():
+    settings.save(request.json)
+    return jsonify(ok=True)
+
+
+@app.post("/api/files")
+def files():
+    duckdb_files, flat_files = source.find_files(request.json["path"])
+    choices = [*map(str, duckdb_files)] + ([source.ALL_FLAT] if flat_files else [])
+    if not choices:
+        raise ValueError("DuckDB·Parquet·CSV 파일이 없습니다.")
+    return jsonify(files=choices)
+
+
+def open_con(info):
+    """연결 요청 값(folder는 path·file, url은 url·user·password)으로 연결을 연다."""
+    if info["kind"] == "folder":
+        if info["file"] == source.ALL_FLAT:
+            return source.open_flat_files(source.find_files(info["path"])[1])
+        return source.open_duckdb(info["file"])
+    return source.open_url(info["url"], info.get("user", ""), info.get("password", ""))
+
+
+@app.post("/api/connect")
+def connect():
+    """새 연결이 실패하면 이전 연결을 다시 열어 둔다."""
+    body = request.json
+    keys = ("path", "file") if body["kind"] == "folder" else ("url", "user", "password")
+    new, old = {"kind": body["kind"], **{k: body[k] for k in keys if k in body}}, state["opened"]
+    if state["con"] is not None:  # 이전 연결을 닫아야 같은 파일을 다시 열 수 있다.
+        source.close(state["con"])
+        state.update(con=None, password="", opened=None)
+    try:
+        con = open_con(new)
+    except Exception as e:
+        message = source.mask(str(e), new.get("password", ""))  # 복원 뒤에는 이전 비밀번호로만 가려지므로 여기서 가린다.
+        if old:
+            try:
+                state.update(con=open_con(old), password=old.get("password", ""), opened=old)
+            except Exception:
+                message += " 이전 연결도 다시 열 수 없어 연결이 끊겼습니다."
+        raise ValueError(message) from None
+    state.update(con=con, password=new.get("password", ""), opened=new)
+    return jsonify(schemas=source.list_schemas(con))
+
+
+@app.get("/api/tables")
+def tables():
+    return jsonify(tables=source.list_tables(get_con(), request.args.get("schema") or None))
+
+
+@app.post("/api/columns")
+def columns():
+    return jsonify(columns=result.columns(build(request.json, select=False)))
+
+
+@app.post("/api/query")
+def query():
+    expr = build(request.json)
+    return jsonify(
+        count=result.get_count(expr),
+        rows=to_json(result.get_rows(expr, parse.parse_limit(request.json.get("limit", 20)))),
+    )
+
+
+@app.post("/api/summary")
+def summary():
+    """컬럼별 집계. 큰 테이블에서는 오래 걸리므로 검색과 따로, 화면에서 요청할 때만 계산한다."""
+    return jsonify(summary=to_json(result.get_summary(build(request.json))))
+
+
+@app.post("/api/export")
+def export():
+    """조건에 맞는 전체 행을 임시 파일로 만들어 조금씩 내려보내고, 다 보내면 지운다."""
+    folder = tempfile.mkdtemp()
+    path = Path(folder, "result." + request.json.get("format", ""))
+    try:
+        result.export(build(request.json), path)
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+    bom = b"\xef\xbb\xbf" if path.suffix == ".csv" else b""  # Excel이 CSV의 한글을 바로 읽도록 맨 앞에 붙인다.
+
+    def stream():
+        try:
+            yield bom
+            with open(path, "rb") as f:
+                yield from iter(lambda: f.read(1 << 20), b"")
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    headers = {"Content-Disposition": f"attachment; filename={path.name}", "Content-Length": path.stat().st_size + len(bom)}
+    return Response(stream(), mimetype="application/octet-stream", headers=headers)
+
+
+@app.post("/api/chart")
+def chart():
+    body = request.json
+    df = result.get_chart(build(body, select=False), body["x"], body.get("y"), body["agg"], body.get("order", "x"))
+    return jsonify(
+        labels=[str(v) for v in df[body["x"]]], values=df["value"].to_list(), max_groups=result.MAX_GROUPS
+    )

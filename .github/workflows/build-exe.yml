@@ -1,0 +1,20 @@
+# Actions 탭 → build-exe → Run workflow 를 누르면 Windows용 프로그램 폴더를 만든다.
+name: build-exe
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: >
+          pip install -r requirements.txt pyinstaller "psycopg[binary]"
+          "ibis-framework[athena,bigquery,clickhouse,databricks,druid,exasol,impala,materialize,mssql,mysql,oracle,postgres,risingwave,singlestoredb,snowflake,sqlite,trino]"
+      - run: pyinstaller ibis_search.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ibis_search-windows
+          path: dist/ibis_search/

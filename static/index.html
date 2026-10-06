@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ibis 검색</title>
+<script src="/static/chart.umd.min.js"></script>
+<script>
+  // 저장된 설정. 서버가 쿠키로 알려 준다. 고른 적이 없으면 undefined.
+  const saved = name => (document.cookie.match(new RegExp("(?:^|; )" + name + "=(\\w+)")) || [])[1];
+  // 화면 모드: 저장된 설정이 있으면 그것, 없으면 Windows 설정. 그리기 전에 정해 깜빡임을 막는다.
+  document.documentElement.dataset.theme = saved("theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+</script>
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --head:#f9fafb; --line:#dde1e6; --text:#1f2933; --muted:#6b7480; --accent:#2f5bea; --err:#c62828; --ok:#2e7d32; color-scheme:light; }
+  :root[data-theme=dark] { --bg:#15171c; --card:#1e2128; --head:#262a33; --line:#343945; --text:#e6e8ec; --muted:#9aa3b2; --accent:#4a72f0; --err:#ef6b6b; --ok:#66bb6a; color-scheme:dark; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
+  .layout { display:grid; grid-template-columns:340px 1fr; gap:16px; padding:16px; min-height:100vh; }
+  .panel, .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .panel { align-self:start; position:sticky; top:16px; max-height:calc(100vh - 32px); overflow:auto; }
+  .main { display:flex; flex-direction:column; gap:16px; min-width:0; }
+  h2 { font-size:13px; margin:14px 0 6px; color:var(--muted); }
+  h2:first-child { margin-top:0; }
+  h3 { font-size:15px; margin:0 0 10px; }
+  input, select, button { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; width:100%; }
+  input, select { background:var(--card); color:var(--text); }
+  #theme { float:right; }
+  button { background:var(--accent); color:#fff; border:none; cursor:pointer; width:auto; padding:6px 12px; flex:none; white-space:nowrap; }
+  button:disabled { opacity:.55; cursor:wait; }
+  .row input { flex:1; min-width:0; }
+  .ok { color:var(--ok); font-size:12px; min-height:16px; }
+  button.ghost { background:none; color:var(--muted); padding:0 6px; }
+  .row { display:flex; gap:6px; margin-bottom:6px; }
+  .row.save { align-items:center; justify-content:flex-end; margin:10px 0 0; }
+  .tabs label { margin-right:12px; }
+  .hint { color:var(--muted); font-size:12px; margin:2px 0 6px; }
+  .err { color:var(--err); font-size:12px; min-height:16px; }
+  ul.items { list-style:none; margin:0 0 4px; padding:0; }
+  ul.items li { display:flex; justify-content:space-between; background:var(--bg); border-radius:6px; padding:3px 8px; margin-bottom:4px; }
+  .cols { font-size:12px; color:var(--muted); max-height:140px; overflow:auto; }
+  .hidden { display:none; }
+  /* 검색 줄은 위 항목이 길어져도 패널 아래쪽에 붙어 늘 보인다. 붙는 기준이 패널 안쪽 여백(14px) 안이라, 그만큼 내려 여백까지 덮어 밑으로 비치는 것이 없게 한다. */
+  .search-box { position:sticky; bottom:-14px; margin:14px -14px -14px; padding:10px 14px 14px; background:var(--card); border-top:1px solid var(--line); }
+  .table-wrap { overflow:auto; max-height:420px; }
+  table { border-collapse:collapse; font-size:12px; white-space:nowrap; }
+  th, td { border-bottom:1px solid var(--line); padding:4px 10px; text-align:left; }
+  th { position:sticky; top:0; background:var(--head); }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  /* 고르는 칸은 남는 너비를 고르게 나눠 갖고(최소 120px), 카드가 좁으면 다음 줄로 넘어간다. 버튼은 제 너비를 지킨다. */
+  .chart-controls { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+  .chart-controls select { flex:1 1 120px; }
+  /* 높이 400px을 기준으로 비율(--ratio = 가로/세로)만큼 넓어진다. 카드보다 넓어지면 카드 너비에 맞춰 줄어든다. */
+  .chart-box { width:min(100%, calc(400px * var(--ratio, 16 / 9))); aspect-ratio:var(--ratio, 16 / 9); margin:0 auto; }
+  .row.save select { width:auto; }
+  .empty { color:var(--muted); }
+  /* 스크롤바: 프로그램 창이 내용 위에 겹쳐 그리고 스크롤할 때만 보여 준다(desktop.py). 여기서 모양을 정하면 겹쳐 그리지 않으므로,
+     그 기능이 꺼져 자리를 차지할 때만(.thin, 맨 아래 스크립트) 얇고 반투명하게, 화살표 버튼과 회색 바탕 없이 그린다. */
+  .thin, .thin * {
+    &::-webkit-scrollbar { width:8px; height:8px; }
+    &::-webkit-scrollbar-button { display:none; }
+    &::-webkit-scrollbar-track, &::-webkit-scrollbar-corner { background:transparent; }
+    &::-webkit-scrollbar-thumb { background:color-mix(in srgb, var(--text) 30%, transparent); border-radius:4px; }
+    &::-webkit-scrollbar-thumb:hover { background:color-mix(in srgb, var(--text) 50%, transparent); }
+  }
+  @media (max-width:800px) { .layout { grid-template-columns:1fr; } .panel { position:static; max-height:none; } }
+</style>
+</head>
+<body>
+<div class="layout">
+  <!-- 입력 패널 -->
+  <aside class="panel">
+    <button id="theme" class="ghost"></button>
+    <h2>1. 연결</h2>
+    <div class="tabs">
+      <label><input type="radio" name="kind" value="folder" checked style="width:auto"> 내 폴더 파일</label>
+      <label><input type="radio" name="kind" value="url" style="width:auto"> DB 주소</label>
+    </div>
+    <div id="folder-box">
+      <div class="row"><input id="path" placeholder="폴더 경로 (예: ./data)" value="."><button id="find">찾기</button></div>
+      <select id="file" class="hidden"></select>
+    </div>
+    <div id="url-box" class="hidden">
+      <input id="url" placeholder="mssql://host:1433/db" style="margin-bottom:6px">
+      <input id="user" placeholder="아이디 (없으면 비움)" style="margin-bottom:6px">
+      <input id="password" type="password" placeholder="비밀번호 (없으면 비움)">
+    </div>
+    <div class="row" style="margin-top:6px"><button id="connect">연결</button></div>
+    <div class="err" id="err-connect"></div>
+
+    <div id="after-connect" class="hidden">
+      <h2>2. 테이블</h2>
+      <select id="schema" class="hidden" style="margin-bottom:6px"></select>
+      <select id="base"></select>
+      <div class="cols" id="cols"></div>
+
+      <h2>3. 조인</h2>
+      <div class="hint">테이블 [inner|left|right|outer] 왼쪽=오른쪽</div>
+      <div id="joins"></div>
+
+      <h2>4. 기간</h2>
+      <div class="hint">날짜컬럼 2025-07-01 ~ 2025-09-30 (한쪽 비워도 됨)</div>
+      <div id="periods"></div>
+
+      <h2>5. 조건</h2>
+      <div class="hint">컬럼 &gt;= 값 / 컬럼 != 값 / 컬럼 between 값1 값2 / 컬럼 in 값1, 값2 / 컬럼 except 값1, 값2 / 컬럼 like 값 / 컬럼 is [not] null / 조건 or 조건 / 값에 or·쉼표가 있으면 '값'</div>
+      <div id="conditions"></div>
+      <label class="hint" title="끄면 따옴표를 글자 그대로 찾습니다. 추가할 때의 상태가 그 줄에 적용됩니다."><input type="checkbox" id="quotes" checked style="width:auto"> '값'의 따옴표를 값을 감싸는 기호로 읽기</label>
+
+      <h2>6. 정렬</h2>
+      <div class="hint">컬럼 [asc|desc]</div>
+      <div id="sorts"></div>
+
+      <h2>7. 표시 컬럼</h2>
+      <div class="hint">컬럼1, 컬럼2 (비우면 전체)</div>
+      <div id="columns"></div>
+
+      <div class="search-box">
+        <h2>8. 검색</h2>
+        <div class="row"><input id="limit" type="number" value="20" min="1" style="width:90px"><span class="hint" style="align-self:center">행</span><button id="search">검색</button></div>
+        <div class="row"><input id="maxlen" type="number" value="40" min="0" style="width:90px"><span class="hint" style="align-self:center">글자까지 표시 (0 = 전체)</span></div>
+        <div class="err" id="err-search"></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 결과 -->
+  <main class="main">
+    <section class="card">
+      <h3 id="rows-title">결과</h3>
+      <div class="table-wrap" id="rows"><span class="empty">검색하면 결과가 여기에 표시됩니다.</span></div>
+      <div class="row save"><span class="hint">조건에 맞는 전체 행 저장</span>
+        <button data-export="csv">CSV</button><button data-export="xlsx">Excel</button><button data-export="parquet">Parquet</button></div>
+      <div class="err" id="err-export"></div>
+    </section>
+    <section class="card">
+      <h3>집계</h3>
+      <div class="row"><button id="summarize">집계 계산</button></div>
+      <div class="err" id="err-summary"></div>
+      <div class="table-wrap" id="summary"></div>
+    </section>
+    <section class="card">
+      <h3>차트</h3>
+      <div class="chart-controls">
+        <select id="cx" title="X 컬럼"></select>
+        <select id="cy" title="Y 컬럼 (개수일 때는 비워 둡니다)"></select>
+        <select id="cagg"><option value="count">개수</option><option value="sum">합계</option><option value="mean">평균</option></select>
+        <select id="ctype"><option value="bar">막대</option><option value="line">선</option></select>
+        <select id="corder" title="그룹 순서"><option value="x">X 순</option><option value="value">값 큰 순</option></select>
+        <select id="cratio" title="차트 비율"><option value="auto">비율 자동</option><option value="square">1:1</option><option value="wide">16:9</option></select>
+        <button id="draw">그리기</button>
+      </div>
+      <div class="err" id="err-chart"></div>
+      <div class="chart-box"><canvas id="chart"></canvas></div>
+      <div class="row save"><span class="hint">차트 저장</span>
+        <select id="cimage" title="저장할 그림의 모드"><option value="light">라이트</option><option value="dark">다크</option></select>
+        <button data-image="png">PNG</button><button data-image="jpeg">JPG</button></div>
+    </section>
+  </main>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const LISTS = ["joins", "periods", "conditions", "sorts", "columns"];  // 한 줄씩 모으는 입력. 서버로 보내는 이름과 같다.
+const S = { schema: "", base: "", cols: [], ...Object.fromEntries(LISTS.map(k => [k, []])) };
+let last = null;  // 마지막 검색 결과(rows)와 집계(summary). 글자 수를 바꾸면 다시 조회하지 않고 표만 다시 그린다.
+let chart = null;
+let drawn = null;  // 마지막으로 그린 차트의 내용. 화면 모드를 바꾸거나 저장할 때 다시 그린다.
+
+async function send(url, body) {
+  const res = await fetch(url, body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error((await res.json()).error);
+  return res;
+}
+const api = async (url, body) => (await send(url, body)).json();
+const state = () => ({ schema: S.schema, base: S.base, ...Object.fromEntries(LISTS.map(k => [k, S[k]])) });
+const download = (href, name) => Object.assign(document.createElement("a"), { href, download: name }).click();
+const esc = v => String(v ?? "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const fill = (sel, items, blank) => sel.innerHTML = (blank ? `<option value="">${blank}</option>` : "") +
+  items.map(v => `<option>${esc(v)}</option>`).join("");
+// 연결 메시지: 성공("연결됨")만 초록색, 나머지는 오류 색.
+const connMsg = (text, ok) => { $("err-connect").textContent = text; $("err-connect").className = ok ? "ok" : "err"; };
+// 요청하는 동안 버튼을 잠그고 "…"로 바꿨다가, 실패해도 되돌린다. 너비는 그대로 두고, 잠긴 동안 다시 부르면 무시한다.
+async function busy(button, fn) {
+  if (button.disabled) return;
+  const label = button.textContent;
+  button.style.minWidth = button.offsetWidth + "px";
+  button.disabled = true;
+  button.textContent = "…";
+  try { return await fn(); }
+  finally { button.disabled = false; button.textContent = label; button.style.minWidth = ""; }
+}
+
+// 1. 연결
+document.querySelectorAll("input[name=kind]").forEach(r => r.onchange = () => {
+  const folder = r.value === "folder" && r.checked;
+  $("folder-box").classList.toggle("hidden", !folder);
+  $("url-box").classList.toggle("hidden", folder);
+});
+$("find").onclick = () => busy($("find"), async () => {
+  try { fill($("file"), (await api("/api/files", { path: $("path").value })).files);
+        $("file").classList.remove("hidden"); connMsg(""); }
+  catch (e) { connMsg(e.message); }
+});
+$("connect").onclick = () => busy($("connect"), async () => {
+  const kind = document.querySelector("input[name=kind]:checked").value;
+  const body = kind === "folder"
+    ? { kind, path: $("path").value, file: $("file").value }
+    : { kind, url: $("url").value, user: $("user").value, password: $("password").value };
+  try {
+    const { schemas } = await api("/api/connect", body);
+    connMsg("연결됨", true);
+    $("schema").classList.toggle("hidden", !schemas.length);
+    fill($("schema"), schemas, "기본 스키마");
+    $("after-connect").classList.remove("hidden");
+    await loadTables();
+  } catch (e) { connMsg(e.message); }
+});
+
+// 2. 테이블
+async function loadTables() {
+  S.schema = $("schema").value;
+  const { tables } = await api("/api/tables?schema=" + encodeURIComponent(S.schema));
+  fill($("base"), tables, "기준 테이블 선택");
+}
+$("schema").onchange = loadTables;
+$("base").onchange = async () => {
+  S.base = $("base").value;
+  LISTS.forEach(k => { S[k] = []; renderList(k); });
+  await refreshColumns();
+};
+async function refreshColumns() {
+  if (!S.base) return;
+  S.cols = (await api("/api/columns", state())).columns;
+  $("cols").innerHTML = S.cols.map(([n, t]) => `${esc(n)} (${esc(t)})`).join("<br>");
+  fill($("cx"), S.cols.map(c => c[0]));
+  fill($("cy"), S.cols.filter(c => c[1] === "정수" || c[1] === "실수").map(c => c[0]), "Y 없음");
+}
+
+// 3~7. 조인·기간·조건·정렬·표시 컬럼: 한 줄 입력 → 서버에서 검사 → 목록에 추가
+function renderList(key) {
+  const box = $(key);
+  box.innerHTML = `<ul class="items">${S[key].map((item, i) =>  // 따옴표 해석을 끄고 넣은 조건은 { line, quotes: false }
+      `<li><span>${esc(item.line ?? item)}${item.line === undefined ? "" : ' <span class="hint">따옴표 그대로</span>'}</span><button class="ghost" data-i="${i}">×</button></li>`).join("")}</ul>
+    <div class="row"><input placeholder="입력 후 Enter"><button>추가</button></div><div class="err"></div>`;
+  const input = box.querySelector("input"), err = box.querySelector(".err"), button = box.querySelector(".row button");
+  const add = () => busy(button, async () => {  // 요청 중에는 Enter를 다시 눌러도 보내지 않는다.
+    const line = input.value.trim();
+    if (!line) return;
+    const item = key === "conditions" && !$("quotes").checked ? { line, quotes: false } : line;
+    const next = { ...state(), [key]: [...S[key], item] };
+    try { await api("/api/columns", next); S[key].push(item); renderList(key); await refreshColumns(); }
+    catch (e) { err.textContent = e.message; }
+  });
+  button.onclick = add;
+  input.onkeydown = e => { if (e.key === "Enter") add(); };
+  box.querySelectorAll("button.ghost").forEach(b => b.onclick = async () => {
+    S[key].splice(+b.dataset.i, 1); renderList(key); await refreshColumns();
+  });
+}
+
+// 8. 검색
+// 문자열을 최대 글자 수까지만 보여 주고, 잘린 값은 마우스를 올리면 전체가 보인다.
+function cell(v) {
+  if (typeof v === "number") return `<td class="num">${v.toLocaleString()}</td>`;
+  const s = String(v ?? ""), max = +$("maxlen").value;
+  return max > 0 && s.length > max
+    ? `<td title="${esc(s).replace(/"/g, "&quot;")}">${esc(s.slice(0, max))}…</td>`
+    : `<td>${esc(s)}</td>`;
+}
+function table(data) {
+  if (!data.rows.length) return '<span class="empty">결과가 없습니다.</span>';
+  const head = data.columns.map(c => `<th>${esc(c)}</th>`).join("");
+  const body = data.rows.map(r => "<tr>" + data.columns.map(c => cell(r[c])).join("") + "</tr>").join("");
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+$("search").onclick = () => {
+  if (!S.base) { $("err-search").textContent = "기준 테이블을 고르세요."; return; }
+  return busy($("search"), async () => {
+    try {
+      // 행 수는 입력한 그대로 보낸다. 0·음수·빈칸은 서버가 안내한다.
+      const d = await api("/api/query", { ...state(), limit: $("limit").value });
+      $("rows-title").textContent = `결과 (전체 ${d.count.toLocaleString()}행 중 ${d.rows.rows.length}행)`;
+      last = { rows: d.rows, summary: null };  // 이전 조건의 집계는 지운다.
+      renderTables();
+      $("err-search").textContent = $("err-summary").textContent = "";
+    } catch (e) { $("err-search").textContent = e.message; }
+  });
+};
+// 집계: 큰 테이블에서는 오래 걸려 검색과 따로, 버튼을 누를 때만 계산한다.
+$("summarize").onclick = () => {
+  if (!S.base) { $("err-summary").textContent = "기준 테이블을 고르세요."; return; }
+  return busy($("summarize"), async () => {
+    const before = last;
+    try {
+      const { summary } = await api("/api/summary", state());
+      if (last !== before) return;  // 계산하는 사이 새로 검색했으면 버린다.
+      last = { ...last, summary };
+      renderTables();
+      $("err-summary").textContent = "";
+    } catch (e) { if (last === before) $("err-summary").textContent = e.message; }
+  });
+};
+
+const SUMMARY_HINT = '<span class="empty">[집계 계산]을 누르면 지금 조건의 컬럼별 집계를 계산합니다.</span>';
+function renderTables() {
+  if (last?.rows) $("rows").innerHTML = table(last.rows);
+  $("summary").innerHTML = last?.summary ? table(last.summary) : SUMMARY_HINT;
+}
+$("maxlen").oninput = renderTables;
+renderTables();
+
+// 결과 내보내기: 서버가 만든 파일을 내려받는다.
+document.querySelectorAll("[data-export]").forEach(b => b.onclick = () => {
+  if (!S.base) { $("err-export").textContent = "기준 테이블을 고르세요."; return; }
+  const format = b.dataset.export;
+  return busy(b, async () => {
+    try {
+      const res = await send("/api/export", { ...state(), format });
+      download(URL.createObjectURL(await res.blob()), "result." + format);
+      $("err-export").textContent = "";
+    } catch (e) { $("err-export").textContent = e.message; }
+  });
+});
+
+// 차트
+// 그 모드의 색(CSS 변수). 화면 모드와 다른 모드의 색도 읽을 수 있게 잠깐 바꿨다가 되돌린다.
+function themeColors(theme) {
+  const root = document.documentElement, now = root.dataset.theme;
+  root.dataset.theme = theme;
+  const css = getComputedStyle(root), color = name => css.getPropertyValue(name).trim();
+  const colors = { card: color("--card"), bar: color("--accent"), text: color("--muted"), line: color("--line") };
+  root.dataset.theme = now;
+  return colors;
+}
+function chartConfig(colors, options = {}) {
+  const axis = { ticks: { color: colors.text }, grid: { color: colors.line } };
+  return {
+    type: drawn.type,
+    data: { labels: drawn.labels, datasets: [{ label: drawn.label, data: drawn.values, backgroundColor: colors.bar, borderColor: colors.bar }] },
+    options: { maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: axis, y: axis }, ...options },
+  };
+}
+// 차트 비율(가로/세로). 자동이면 그룹이 5개 이하일 때 1:1, 늘수록 넓어져 25개 이상이면 16:9.
+const RATIOS = { square: 1, wide: 16 / 9 };
+function fitChart() {
+  const groups = drawn ? drawn.labels.length : 25;
+  const auto = 1 + (RATIOS.wide - 1) * Math.min(1, Math.max(0, (groups - 5) / 20));
+  $("chart").parentElement.style.setProperty("--ratio", RATIOS[$("cratio").value] ?? auto);
+}
+function drawChart() {
+  fitChart();
+  if (!drawn) return;
+  if (chart) chart.destroy();
+  chart = new Chart($("chart"), chartConfig(themeColors(document.documentElement.dataset.theme)));
+}
+$("draw").onclick = () => busy($("draw"), async () => {
+  try {
+    const body = { ...state(), x: $("cx").value, y: $("cy").value, agg: $("cagg").value, order: $("corder").value };
+    const d = await api("/api/chart", body);
+    const label = $("cagg").selectedOptions[0].text + (body.agg === "count" ? "" : ` (${body.y})`);
+    drawn = { type: $("ctype").value, labels: d.labels, values: d.values, label };
+    drawChart();
+    $("err-chart").textContent = d.labels.length === d.max_groups ? `그룹이 많아 ${d.max_groups}개만 표시합니다.` : "";
+  } catch (e) { $("err-chart").textContent = e.message; }
+});
+// 차트 내보내기: 고른 저장 모드(화면 모드와 무관)의 색으로 화면과 같은 크기에 다시 그려, 그 모드의 배경 위에 옮겨 저장한다.
+document.querySelectorAll("[data-image]").forEach(b => b.onclick = () => {
+  if (!chart) { $("err-chart").textContent = "먼저 차트를 그리세요."; return; }
+  const colors = themeColors($("cimage").value), src = $("chart");
+  const copy = Object.assign(document.createElement("canvas"), { width: src.clientWidth, height: src.clientHeight });
+  const redrawn = new Chart(copy, chartConfig(colors, { responsive: false, animation: false, devicePixelRatio: src.width / src.clientWidth }));
+  const out = Object.assign(document.createElement("canvas"), { width: copy.width, height: copy.height });
+  const ctx = out.getContext("2d");
+  ctx.fillStyle = colors.card;
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(copy, 0, 0);
+  redrawn.destroy();
+  download(out.toDataURL("image/" + b.dataset.image), "chart." + (b.dataset.image === "jpeg" ? "jpg" : "png"));
+});
+
+// 설정(화면 모드, 차트 비율, 차트 저장 모드): 바꾸면 서버가 설정 파일에 저장해 다음 실행 때도 쓴다.
+const saveSetting = changes => api("/api/settings", changes).catch(e => connMsg(e.message));
+function showTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  $("theme").textContent = theme === "dark" ? "라이트 모드" : "다크 모드";
+  drawChart();
+}
+$("theme").onclick = () => {
+  const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  showTheme(theme);
+  saveSetting({ theme });
+};
+$("cratio").onchange = () => { fitChart(); saveSetting({ ratio: $("cratio").value }); };
+$("cimage").onchange = () => saveSetting({ image: $("cimage").value });
+$("cratio").value = saved("ratio") || "auto";
+$("cimage").value = saved("image") || "light";
+$("quotes").checked = saved("quotes") !== "off";
+$("quotes").onchange = () => saveSetting({ quotes: $("quotes").checked ? "on" : "off" });
+showTheme(document.documentElement.dataset.theme);
+
+// 스크롤바가 자리를 차지하는지(겹쳐 그리는 기능이 꺼졌는지) 재어 보고, 그렇다면 얇은 스크롤바(.thin)로 바꾼다.
+const probe = document.body.appendChild(Object.assign(document.createElement("div"),
+  { style: "position:absolute; visibility:hidden; width:50px; height:50px; overflow:scroll" }));
+document.documentElement.classList.toggle("thin", probe.offsetWidth > probe.clientWidth);
+probe.remove();
+</script>
+</body>
+</html>

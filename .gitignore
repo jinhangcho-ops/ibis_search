@@ -1,0 +1,11 @@
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.csv
+*.xlsx
+__pycache__/
+.venv/
+build/
+dist/
+check.py
+CLAUDE.md

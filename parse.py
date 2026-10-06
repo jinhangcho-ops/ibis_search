@@ -1,0 +1,212 @@
+"""한 줄 입력(조인·기간·조건·정렬·표시 컬럼)을 해석해 Ibis 식으로 바꾼다. 입력·출력은 하지 않는다."""
+import datetime as dt
+import difflib
+import functools
+import operator
+import re
+
+JOINS = ["inner", "left", "right", "outer"]
+OPS = {"=": operator.eq, "!=": operator.ne, ">=": operator.ge, "<=": operator.le, ">": operator.gt, "<": operator.lt}
+CONDITION_GUIDE = "컬럼 >= 값 / 컬럼 != 값 / 컬럼 between 값1 값2 / 컬럼 in 값1, 값2 / 컬럼 except 값1, 값2 / 컬럼 like 값 / 컬럼 is [not] null / 조건 or 조건 / 값에 or·쉼표가 있으면 '값'"
+SORT_GUIDE = "컬럼 [asc|desc]"
+
+# (판별, 한글 이름, 입력값 변환)
+TYPES = [
+    (lambda t: t.is_boolean(), "참/거짓", lambda s: {"true": True, "false": False}[s.lower()]),
+    (lambda t: t.is_integer(), "정수", int),
+    (lambda t: t.is_floating() or t.is_decimal(), "실수", float),
+    (lambda t: t.is_date(), "날짜", dt.date.fromisoformat),
+    (lambda t: t.is_timestamp(), "날짜시간", dt.datetime.fromisoformat),
+    (lambda t: t.is_string(), "문자", str),
+]
+
+COND_RE = re.compile(r"^(\S+?)\s*(!=|>=|<=|=|>|<)\s*(.+)$")
+BETWEEN_RE = re.compile(r"^(\S+)\s+between\s+(\S+)\s+(?:and\s+)?(\S+)$", re.I)
+IN_RE = re.compile(r"^(\S+)\s+(in|except)\s+(.+)$", re.I)
+LIKE_RE = re.compile(r"^(\S+)\s+like\s+(.+)$", re.I)
+NULL_RE = re.compile(r"^(\S+)\s+is\s+(not\s+)?null$", re.I)
+OR_RE = re.compile(r"(?<!\S)or(?!\S)", re.I)  # 앞뒤가 공백인 단어 or
+COMMA_RE = re.compile(",")
+# 따옴표로 감싼 값: 값의 맨 앞(줄 처음이나 공백 , = < > 뒤)에서 열고, 값의 맨 뒤(줄 끝이나 공백 , 앞)에서 닫는다
+QUOTE_RE = re.compile(r"""(?<![^\s,=<>])(['"])(?:.*?\1(?![^\s,]))?""")
+
+
+def type_info(dtype):
+    """(한글 이름, 변환 함수). 모르는 타입은 문자로 다룬다."""
+    return next(((name, cast) for check, name, cast in TYPES if check(dtype)), (str(dtype), str))
+
+
+def convert(dtype, text):
+    name, cast = type_info(dtype)
+    try:
+        return cast(text)
+    except (ValueError, KeyError):
+        raise ValueError(f"'{text}'은 {name} 값이 아닙니다.")
+
+
+def split(pattern, text, quotes=True):
+    """pattern으로 나눈다. 따옴표로 감싼 부분은 나누지 않는다. quotes가 False면 따옴표도 글자로 본다."""
+    if not quotes:
+        return pattern.split(text)
+    quoted = [m.span() for m in QUOTE_RE.finditer(text)]
+    if any(end - start == 1 for start, end in quoted):
+        raise ValueError("따옴표가 닫히지 않았습니다. 값에 따옴표가 있으면 다른 따옴표로 감싸세요.")
+    parts, pos = [], 0
+    for m in pattern.finditer(text):
+        if not any(start <= m.start() < end for start, end in quoted):
+            parts.append(text[pos:m.start()])
+            pos = m.end()
+    return parts + [text[pos:]]
+
+
+def unquote(text, quotes=True):
+    """앞뒤 공백을 떼고, 값 전체를 감싼 따옴표 한 쌍이 있으면 벗긴다. quotes가 False면 벗기지 않는다."""
+    text = text.strip()
+    if not quotes:
+        return text
+    m = QUOTE_RE.match(text)
+    return text[1:-1] if m and len(text) > 1 and m.end() == len(text) else text
+
+
+def check_name(name, names, what="컬럼"):
+    if name not in names:
+        close = difflib.get_close_matches(name, list(names), n=1)
+        raise ValueError(f"'{name}' {what}이 없습니다." + (f" 비슷한 이름: {close[0]}" if close else ""))
+
+
+# 조인: "테이블 [inner|left|right|outer] 왼쪽=오른쪽, ..."
+def parse_join(line, tables):
+    name, _, rest = line.partition(" ")
+    check_name(name, tables, "테이블")
+    first, _, after = rest.strip().partition(" ")
+    how, keys = (first.lower(), after) if first.lower() in JOINS else ("inner", rest)
+    pairs = []
+    for k in keys.split(","):
+        left, _, right = (s.strip() for s in k.partition("="))
+        if left:
+            pairs.append((left, right or left))
+    if not pairs:
+        raise ValueError("조인 컬럼을 입력하세요. 예: customers left customer_id=id")
+    return name, how, pairs
+
+
+def apply_joins(base, joins, get_table):
+    """joins: [(테이블, 종류, [(왼쪽, 오른쪽)])]. 컬럼이 없으면 ValueError."""
+    expr = base
+    for name, how, pairs in joins:
+        right = get_table(name)
+        for left, r in pairs:
+            check_name(left, expr.columns)
+            check_name(r, right.columns)
+        expr = expr.join(right, [expr[left] == right[r] for left, r in pairs], how=how)
+    return expr
+
+
+# 기간: "날짜컬럼 시작 ~ 끝" (한쪽은 비워도 됨)
+def parse_period(line, expr):
+    col, _, rng = line.partition(" ")
+    date_cols = [c for c, t in expr.schema().items() if t.is_date() or t.is_timestamp()]
+    check_name(col, date_cols, "날짜 컬럼")
+    start, sep, end = (s.strip() for s in rng.partition("~"))
+    if not sep or not (start or end):
+        raise ValueError("'날짜컬럼 시작 ~ 끝' 형식으로 입력하세요.")
+    dtype = expr.schema()[col]
+    preds = []
+    if start:
+        preds.append(expr[col] >= convert(dtype, start))
+    if end:
+        value = convert(dtype, end)
+        # 날짜시간 컬럼에 끝을 날짜로만 쓰면 그날 끝까지 포함한다
+        after = dtype.is_timestamp() and next_day(end)
+        preds.append(expr[col] < after if after else expr[col] <= value)
+    return f"{col} {start or '처음'} ~ {end or '끝'}", preds
+
+
+def next_day(text):
+    """날짜만 쓴 값이면 다음 날 0시, 시간이 있으면 None."""
+    try:
+        return dt.datetime.combine(dt.date.fromisoformat(text), dt.time()) + dt.timedelta(days=1)
+    except (ValueError, OverflowError):
+        return None
+
+
+# 조건: CONDITION_GUIDE의 형식 중 하나. 한 줄에서 or로 나눈 조건은 하나만 맞아도 된다
+# 값을 '값'이나 "값"으로 감싸면 그 안의 or와 쉼표는 값의 일부다. 설명에는 따옴표를 벗긴 값을 쓴다
+# quotes가 False면 따옴표를 해석하지 않고 글자 그대로 찾는다(줄마다 화면에서 정한다)
+def parse_condition(line, expr, quotes=True):
+    parts = split(OR_RE, line, quotes)
+    if len(parts) == 1:
+        return parse_one(line, expr, quotes)
+    descs, preds = zip(*(parse_one(p.strip(), expr, quotes) for p in parts))
+    return " or ".join(descs), functools.reduce(operator.or_, preds)
+
+
+def parse_one(line, expr, quotes=True):
+    schema = expr.schema()
+    if m := NULL_RE.match(line):
+        col, negate = m.groups()
+        check_name(col, schema.names)
+        return f"{col} is {'not ' if negate else ''}null", expr[col].notnull() if negate else expr[col].isnull()
+    if m := BETWEEN_RE.match(line):
+        col, lo, hi = m.groups()
+        check_name(col, schema.names)
+        lo, hi = convert(schema[col], unquote(lo, quotes)), convert(schema[col], unquote(hi, quotes))
+        return f"{col} between {lo} and {hi}", expr[col].between(lo, hi)
+    if m := IN_RE.match(line):  # except는 in의 반대: 적은 값을 뺀다
+        col, word, raw = m.groups()
+        check_name(col, schema.names)
+        word = word.lower()
+        values = [convert(schema[col], unquote(v, quotes)) for v in split(COMMA_RE, raw, quotes) if v.strip()]
+        pred = expr[col].isin(values) if word == "in" else expr[col].notin(values)
+        return f"{col} {word} ({', '.join(map(str, values))})", pred
+    if m := LIKE_RE.match(line):  # 포함 검색. 대소문자는 가리지 않는다
+        col, raw = m.groups()
+        check_name(col, schema.names)
+        if not schema[col].is_string():
+            raise ValueError("like는 문자 컬럼에만 쓸 수 있습니다.")
+        raw = unquote(raw, quotes)
+        return f"{col} like {raw}", expr[col].lower().contains(raw.lower())
+    if m := COND_RE.match(line):
+        col, op, raw = m.groups()
+        check_name(col, schema.names)
+        value = convert(schema[col], unquote(raw, quotes))
+        return f"{col} {op} {value}", OPS[op](expr[col], value)
+    raise ValueError(f"형식: {CONDITION_GUIDE}")
+
+
+# 정렬: "컬럼 [asc|desc]"
+def parse_sort(line, expr):
+    col, _, how = line.partition(" ")
+    how = how.strip().lower() or "asc"
+    check_name(col, expr.columns)
+    if how not in ("asc", "desc"):
+        raise ValueError(f"형식: {SORT_GUIDE}")
+    return f"{col} {how}", expr[col].desc() if how == "desc" else expr[col].asc()
+
+
+# 표시 컬럼: "컬럼1, 컬럼2"
+def parse_columns(line, expr):
+    cols = [c.strip() for c in line.split(",") if c.strip()]
+    for c in cols:
+        check_name(c, expr.columns)
+    return ", ".join(cols), cols
+
+
+def apply(expr, preds, keys, cols):
+    """조건 → 정렬 → 표시 컬럼 순으로 적용한다. 빈 목록은 건너뛴다."""
+    if preds:
+        expr = expr.filter(*preds)
+    if keys:
+        expr = expr.order_by(keys)
+    return expr.select(list(dict.fromkeys(cols))) if cols else expr
+
+
+# 행 수: 1 이상의 정수 (화면에서 JSON 값으로 들어온다)
+def parse_limit(value):
+    try:
+        n = int(str(value).strip())
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise ValueError("행 수는 1 이상의 정수로 입력하세요.")
+    return n
