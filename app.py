@@ -138,6 +138,15 @@ def connect():
     return jsonify(schemas=source.list_schemas(con))
 
 
+@app.post("/api/disconnect")
+def disconnect():
+    """연결을 끊고 파일·접속을 놓는다. 연결이 없으면 아무 일도 하지 않는다."""
+    if state["con"] is not None:
+        source.close(state["con"])
+    state.update(con=None, password="", opened=None)
+    return jsonify(ok=True)
+
+
 @app.get("/api/tables")
 def tables():
     return jsonify(tables=source.list_tables(get_con(), request.args.get("schema") or None))

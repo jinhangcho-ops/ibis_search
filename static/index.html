@@ -174,7 +174,7 @@
   <main class="main">
     <section class="card">
       <h3 id="rows-title">결과</h3>
-      <div class="table-wrap" id="rows"><span class="empty">검색하면 결과가 여기에 표시됩니다.</span></div>
+      <div class="table-wrap" id="rows"></div>
       <div class="row save"><span class="hint">조건에 맞는 전체 행 저장</span>
         <button data-export="csv">CSV</button><button data-export="xlsx">Excel</button><button data-export="parquet">Parquet</button></div>
       <div class="err" id="err-export"></div>
@@ -241,7 +241,7 @@ const esc = v => String(v ?? "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&
 const fill = (sel, items, blank) => sel.innerHTML = (blank ? `<option value="">${blank}</option>` : "") +
   items.map(v => `<option>${esc(v)}</option>`).join("");
 // 연결 메시지: 성공("연결됨")만 초록색, 나머지는 오류 색.
-const connMsg = (text, ok) => { $("err-connect").textContent = text; $("err-connect").className = ok ? "ok" : "err"; };
+const connMsg = (text, ok) => { $("err-connect").textContent = text; $("err-connect").className = ok === true ? "ok" : ok || "err"; };  // ok에 "hint"를 주면 안내 색
 // 요청하는 동안 버튼을 잠그고 "…"로 바꿨다가, 실패해도 되돌린다. 너비는 그대로 두고, 잠긴 동안 다시 부르면 무시한다.
 async function busy(button, fn) {
   if (button.disabled) return;
@@ -269,7 +269,39 @@ function showFlat() {
 $("file").onchange = showFlat;
 $("flat-list").onchange = showFlat;
 $("flat-all").onclick = () => { flatBoxes().forEach(b => b.checked = true); showFlat(); };
-$("flat-none").onclick = () => { flatBoxes().forEach(b => b.checked = false); showFlat(); };
+let connected = null;  // 지금 연결의 종류: "flat"(Parquet·CSV 파일), "other"(DuckDB 파일·DB 주소), 없으면 null
+// 화면에 올라온 것(고른 테이블, 조건 등의 목록, 결과·집계·차트)을 비운다. 연결은 건드리지 않는다.
+function clearScreen() {
+  S.base = $("base").value = "";
+  S.cols = [];
+  LISTS.forEach(k => { S[k] = []; renderList(k); });
+  $("cols").innerHTML = "";
+  ["cx", "cy", "bcol"].forEach(id => fill($(id), []));
+  $("bpick").classList.add("hidden");
+  showBuilder();
+  last = drawn = null;
+  if (chart) chart.destroy();
+  chart = null;
+  $("rows-title").textContent = "결과";
+  renderTables();
+  ["err-search", "err-export", "err-summary", "err-chart", "err-builder"].forEach(id => $(id).textContent = "");
+}
+// [모두 해제]: 체크를 모두 푼다. Parquet·CSV로 연결돼 있었으면 그 연결을 끊고 화면을 연결 전으로 되돌린다(파일을 다시 골라 새로 연결).
+// DuckDB 파일이나 DB 주소로 연결돼 있었으면 연결은 그대로 두고 화면에 올라온 것만 비운다.
+$("flat-none").onclick = () => busy($("flat-none"), async () => {
+  flatBoxes().forEach(b => b.checked = false);
+  showFlat();
+  if (!connected) return;
+  try {
+    if (connected === "flat") {
+      await api("/api/disconnect", {});
+      connected = null;
+      $("after-connect").classList.add("hidden");
+      connMsg("연결을 해제했습니다. 쓸 파일을 고르고 [연결]을 누르세요.", "hint");
+    } else connMsg("연결은 그대로 두고 화면만 비웠습니다. 테이블을 다시 고르세요.", "hint");
+    clearScreen();
+  } catch (e) { connMsg(e.message); }
+});
 $("find").onclick = () => busy($("find"), async () => {
   try {
     const d = await api("/api/files", { path: $("path").value });
@@ -292,6 +324,8 @@ $("connect").onclick = () => busy($("connect"), async () => {
     : { kind, url: $("url").value, user: $("user").value, password: $("password").value };
   try {
     const { schemas } = await api("/api/connect", body);
+    connected = body.files ? "flat" : "other";
+    clearScreen();  // 이전 연결에서 고른 테이블과 조건은 새 연결과 맞지 않으므로 비운다.
     connMsg("연결됨", true);
     $("schema").classList.toggle("hidden", !schemas.length);
     fill($("schema"), schemas, "기본 스키마");
@@ -460,9 +494,10 @@ $("summarize").onclick = () => {
   });
 };
 
+const ROWS_HINT = '<span class="empty">검색하면 결과가 여기에 표시됩니다.</span>';
 const SUMMARY_HINT = '<span class="empty">[집계 계산]을 누르면 지금 조건의 컬럼별 집계를 계산합니다.</span>';
 function renderTables() {
-  if (last?.rows) $("rows").innerHTML = table(last.rows);
+  $("rows").innerHTML = last?.rows ? table(last.rows) : ROWS_HINT;
   $("summary").innerHTML = last?.summary ? table(last.summary) : SUMMARY_HINT;
 }
 $("maxlen").oninput = renderTables;
