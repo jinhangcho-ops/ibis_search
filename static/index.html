@@ -99,10 +99,12 @@
   .row.save select { width:auto; }
   .empty { color:var(--muted); }
   /* 고르는 칸을 펼친 목록. 창 엔진이 그리는 목록은 화면 모드의 색을 따르지 않아 직접 그린다(맨 아래 스크립트). */
-  .menu { position:fixed; z-index:100; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:4px 0; overflow:auto; box-shadow:0 6px 18px rgb(0 0 0 / .25); }
-  .menu div { padding:5px 10px; white-space:nowrap; cursor:default; }
-  .menu div.now { color:var(--accent); }
-  .menu div.on { background:var(--bg); }
+  .menu { position:fixed; z-index:100; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:4px 0; box-shadow:0 6px 18px rgb(0 0 0 / .25); }
+  .menu input { display:block; width:calc(100% - 12px); margin:2px 6px 4px; }
+  .menu > div { overflow:auto; }
+  .menu div div { padding:5px 10px; white-space:nowrap; cursor:default; }
+  .menu div div.now { color:var(--accent); }
+  .menu div div.on { background:var(--bg); }
   /* 스크롤바(전역): 어디서나 같은 모양. 얇고 반투명하며 화살표 버튼과 바탕이 없다.
      창 엔진의 겹침 스크롤바는 마우스가 닿으면 화살표 달린 두꺼운 모양으로 바뀌고 스타일로 막을 수 없어, 모양을 직접 정한다. */
   ::-webkit-scrollbar { width:8px; height:8px; }
@@ -845,60 +847,72 @@ document.querySelectorAll("[data-size]").forEach(grip => {
 });
 
 // 고르는 칸(select)의 목록을 직접 그린다. 값과 change 이벤트는 select가 그대로 맡고, 펼쳐지는 목록만 바꾼다.
-// 누르거나 Space·Enter·↑↓로 펼치고, 목록에서는 ↑↓로 옮기고 Enter로 고르고 Esc로 닫는다. 글자를 치면 그 글자로 시작하는(없으면 들어 있는) 항목으로 간다.
-const menuBox = document.body.appendChild(Object.assign(document.createElement("div"), { className: "menu hidden" }));
-let menuFor = null, menuAt = -1;  // 목록을 펼친 select와, 지금 가리키는 항목
-let typed = "", typedAt = 0;  // 찾으려고 친 글자들과 마지막으로 친 때. 0.7초 쉬면 새로 시작한다.
+// 누르거나 Space·Enter·↑↓로 펼치고, 목록에서는 ↑↓로 옮기고 Enter로 고르고 Esc로 닫는다.
+// 항목이 많으면 맨 위에 찾는 칸이 나오고, 친 글자가 들어 있는 항목만 남는다(입력 칸으로 받으므로 한글도 된다).
+const menuBox = document.body.appendChild(Object.assign(document.createElement("div"), { className: "menu hidden", innerHTML: '<input placeholder="찾기"><div></div>' }));
+const [menuFind, menuList] = menuBox.children;
+const MENU_FIND = 8;  // 항목이 이보다 많을 때만 찾는 칸을 보인다.
+let menuFor = null, menuAt = null;  // 목록을 펼친 select와, 지금 가리키는 항목
+const menuItems = () => [...menuList.children].filter(item => !item.classList.contains("hidden"));
 function closeMenu() { menuBox.classList.add("hidden"); menuFor = null; }
-function pointMenu(i, scroll) {
-  menuAt = Math.min(Math.max(i, 0), menuBox.children.length - 1);
-  [...menuBox.children].forEach((item, k) => item.classList.toggle("on", k === menuAt));
-  if (scroll) menuBox.children[menuAt].scrollIntoView({ block: "nearest" });
+function pointMenu(item, scroll) {
+  menuAt?.classList.remove("on");
+  menuAt = item || null;
+  menuAt?.classList.add("on");
+  if (scroll) menuAt?.scrollIntoView({ block: "nearest" });
 }
 function openMenu(sel) {
   if (sel.disabled || !sel.options.length) return;
+  const find = sel.options.length > MENU_FIND;
   menuFor = sel;
-  menuBox.replaceChildren(...[...sel.options].map((o, i) => Object.assign(document.createElement("div"), { textContent: o.text, className: i === sel.selectedIndex ? "now" : "" })));
+  menuList.replaceChildren(...[...sel.options].map((o, i) => Object.assign(document.createElement("div"), { textContent: o.text, className: i === sel.selectedIndex ? "now" : "" })));
+  menuFind.value = "";
+  menuFind.classList.toggle("hidden", !find);
+  menuList.style.maxHeight = "";
   menuBox.classList.remove("hidden");
-  // 칸 아래에 펼치되, 아래가 좁고 위가 더 넓으면 위로 펼친다.
-  const r = sel.getBoundingClientRect(), below = innerHeight - r.bottom - 8, above = r.top - 8, up = below < Math.min(menuBox.scrollHeight, 160) && above > below;
-  Object.assign(menuBox.style, { left: r.left + "px", minWidth: r.width + "px", maxHeight: Math.min(300, up ? above : below) + "px",
-                                 top: up ? "" : r.bottom + 2 + "px", bottom: up ? innerHeight - r.top + 2 + "px" : "" });
-  pointMenu(sel.selectedIndex, true);
+  // 칸 아래에 펼치되, 아래가 좁고 위가 더 넓으면 위로 펼친다. 목록은 300px까지만 커지고 넘으면 스크롤된다.
+  const r = sel.getBoundingClientRect(), below = innerHeight - r.bottom - 8, above = r.top - 8, up = below < Math.min(menuBox.offsetHeight, 160) && above > below;
+  Object.assign(menuBox.style, { left: r.left + "px", minWidth: r.width + "px", top: up ? "" : r.bottom + 2 + "px", bottom: up ? innerHeight - r.top + 2 + "px" : "" });
+  menuList.style.maxHeight = Math.min(300, (up ? above : below) - (menuBox.offsetHeight - menuList.offsetHeight)) + "px";
+  pointMenu(menuList.children[sel.selectedIndex], true);
+  if (find) menuFind.focus();
 }
-function pickMenu(i) {
-  const sel = menuFor;
+function pickMenu(item) {
+  const sel = menuFor, i = [...menuList.children].indexOf(item);
   closeMenu();
   sel.focus();
-  if (i === sel.selectedIndex) return;
+  if (i < 0 || i === sel.selectedIndex) return;
   sel.selectedIndex = i;
   sel.dispatchEvent(new Event("change", { bubbles: true }));
 }
+menuFind.oninput = () => {
+  const want = menuFind.value.trim().toLowerCase();
+  [...menuList.children].forEach(item => item.classList.toggle("hidden", !item.textContent.toLowerCase().includes(want)));
+  pointMenu(menuItems()[0], true);
+};
 document.addEventListener("mousedown", e => {
   const sel = e.target.closest("select");
   if (sel) { e.preventDefault(); sel.focus(); menuFor === sel ? closeMenu() : openMenu(sel); }  // preventDefault: 창 엔진의 목록이 뜨지 않게
   else if (!menuBox.contains(e.target)) closeMenu();
 });
-menuBox.onmousemove = e => { if (e.target.parentElement === menuBox) pointMenu([...menuBox.children].indexOf(e.target)); };
-menuBox.onclick = e => { if (e.target.parentElement === menuBox) pickMenu([...menuBox.children].indexOf(e.target)); };
+menuList.onmousemove = e => { if (e.target.parentElement === menuList) pointMenu(e.target); };
+menuList.onclick = e => { if (e.target.parentElement === menuList) pickMenu(e.target); };
 document.addEventListener("keydown", e => {
-  const open = [" ", "Enter", "ArrowDown", "ArrowUp", "F4"].includes(e.key), typing = Date.now() - typedAt < 700;
-  if (!menuFor) { if (open && e.target.matches("select")) { e.preventDefault(); openMenu(e.target); } return; }
-  if (e.key === "Tab") return closeMenu();
-  e.preventDefault();
-  if (e.key === "Escape") { const sel = menuFor; closeMenu(); sel.focus(); }
-  else if (e.key === "ArrowDown" || e.key === "ArrowUp") pointMenu(menuAt + (e.key === "ArrowDown" ? 1 : -1), true);
-  else if (e.key === "Enter" || (e.key === " " && !typing)) pickMenu(menuAt);
-  else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-    typed = (typing ? typed : "") + e.key.toLowerCase();
-    typedAt = Date.now();
-    const texts = [...menuBox.children].map(item => item.textContent.toLowerCase()), starts = texts.findIndex(text => text.startsWith(typed));
-    const found = starts >= 0 ? starts : texts.findIndex(text => text.includes(typed));
-    if (found >= 0) pointMenu(found, true);
+  if (!menuFor) {
+    if ([" ", "Enter", "ArrowDown", "ArrowUp", "F4"].includes(e.key) && e.target.matches("select")) { e.preventDefault(); openMenu(e.target); }
+    return;
   }
+  if (e.isComposing) return;  // 한글을 조합하는 동안의 키는 입력기가 쓴다.
+  const items = menuItems(), step = { ArrowDown: 1, ArrowUp: -1 }[e.key];
+  if (e.key === "Tab") return closeMenu();
+  if (e.key === "Escape") { const sel = menuFor; closeMenu(); sel.focus(); }
+  else if (e.key === "Enter" || (e.key === " " && e.target !== menuFind)) pickMenu(menuAt);
+  else if (step) pointMenu(items[Math.min(Math.max(items.indexOf(menuAt) + step, 0), items.length - 1)], true);
+  else return;
+  e.preventDefault();
 }, true);
 // 목록 밖이 스크롤되거나 창 크기가 바뀌면 칸과 어긋나므로 닫는다.
-document.addEventListener("scroll", e => { if (e.target !== menuBox) closeMenu(); }, true);
+document.addEventListener("scroll", e => { if (!menuBox.contains(e.target)) closeMenu(); }, true);
 addEventListener("resize", closeMenu);
 addEventListener("blur", closeMenu);
 </script>
