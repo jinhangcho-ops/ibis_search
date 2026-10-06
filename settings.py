@@ -1,6 +1,7 @@
 """사용자 설정(화면 모드, 차트 비율, 차트 저장 모드, 따옴표 해석, 조건 입력 방식, 전체 행 수 세기, 끌어서 조절한 크기, 직전 실행의 행당 시간)을 사용자 폴더의 파일에 저장해 다음 실행 때도 쓴다."""
 import json
 import os
+import re
 from pathlib import Path
 
 PATH = Path(os.environ.get("APPDATA") or Path.home()) / "ibis_search" / "settings.json"
@@ -18,13 +19,15 @@ CHOICES = {
 # 끌어서 조절한 크기(px): (최소, 최대). 화면(index.html)의 SIZES와 같아야 한다. 0을 저장하면 기본 크기로 돌아간다.
 SIZES = {"panel": (240, 640), "rows": (120, 1200), "summary": (120, 1200), "chart": (200, 1000)}
 
-# 직전 실행의 행당 시간(나노초/행). 작업 종류(검색·집계·차트·저장)마다 하나. 화면이 예상 시간을 구할 때 쓴다. 상한(MAX_TIME)은 화면(index.html)의 값과 같아야 한다.
-TIMES = ["time_search", "time_summary", "time_chart", "time_export"]
+# 직전 실행의 행당 시간(나노초/행). 작업 종류(검색·집계·차트·저장)와 기준 테이블 행 수의 구간(10배 단위)마다 하나.
+# 이름은 time_종류_구간이고 구간은 행 수의 자릿수 - 1(1,000행 미만은 모두 2)이다. 화면이 예상 시간을 구할 때 같은 구간의 값만 쓴다.
+# 구간과 상한(MAX_TIME)은 화면(index.html)과 같아야 한다.
+TIME = re.compile(r"time_(search|summary|chart|export)_([2-9]|1[0-2])")
 MAX_TIME = 10**12
 
 
 def valid(name, value):
-    if name in TIMES:
+    if TIME.fullmatch(name):
         return type(value) is int and 1 <= value <= MAX_TIME
     if name in SIZES:
         return type(value) is int and SIZES[name][0] <= value <= SIZES[name][1]
