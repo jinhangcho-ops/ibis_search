@@ -38,12 +38,12 @@ def predicate(cond, expr):
     """조건 하나를 Ibis 식으로. 문자열, 따옴표 해석을 끈 {"line": ..., "quotes": False},
     화면에서 or로 이은 묶음 {"any": [조건, ...]} 중 하나다. 묶음 안은 or, 조건끼리는 and."""
     if isinstance(cond, str):
-        return parse.parse_condition(cond, expr)[1]
+        return parse.parse_condition(cond, expr)
     if "any" in cond:
         if not cond["any"]:
             raise ValueError("or로 묶을 조건이 없습니다.")
         return functools.reduce(operator.or_, [predicate(c, expr) for c in cond["any"]])
-    return parse.parse_condition(cond["line"], expr, cond.get("quotes", True))[1]
+    return parse.parse_condition(cond["line"], expr, cond.get("quotes", True))
 
 
 def build(body, select=True):
@@ -57,10 +57,10 @@ def build(body, select=True):
         [parse.parse_join(line, tables) for line in body.get("joins", [])],
         get_table,
     )
-    preds = [p for line in body.get("periods", []) for p in parse.parse_period(line, expr)[1]]
+    preds = [p for line in body.get("periods", []) for p in parse.parse_period(line, expr)]
     preds += [predicate(cond, expr) for cond in body.get("conditions", [])]
-    keys = [parse.parse_sort(line, expr)[1] for line in body.get("sorts", [])]
-    cols = [c for line in body.get("columns", []) for c in parse.parse_columns(line, expr)[1]]
+    keys = [parse.parse_sort(line, expr) for line in body.get("sorts", [])]
+    cols = [c for line in body.get("columns", []) for c in parse.parse_columns(line, expr)]
     return parse.apply(expr, preds, keys, cols if select else [])
 
 

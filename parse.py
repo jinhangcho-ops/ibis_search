@@ -119,7 +119,7 @@ def parse_period(line, expr):
         # 날짜시간 컬럼에 끝을 날짜로만 쓰면 그날 끝까지 포함한다
         after = dtype.is_timestamp() and next_day(end)
         preds.append(expr[col] < after if after else expr[col] <= value)
-    return f"{col} {start or '처음'} ~ {end or '끝'}", preds
+    return preds
 
 
 def next_day(text):
@@ -131,14 +131,13 @@ def next_day(text):
 
 
 # 조건: CONDITION_GUIDE의 형식 중 하나. 한 줄에서 or로 나눈 조건은 하나만 맞아도 된다
-# 값을 '값'이나 "값"으로 감싸면 그 안의 or와 쉼표는 값의 일부다. 설명에는 따옴표를 벗긴 값을 쓴다
+# 값을 '값'이나 "값"으로 감싸면 그 안의 or와 쉼표는 값의 일부다
 # quotes가 False면 따옴표를 해석하지 않고 글자 그대로 찾는다(줄마다 화면에서 정한다)
 def parse_condition(line, expr, quotes=True):
     parts = split(OR_RE, line, quotes)
     if len(parts) == 1:
         return parse_one(line, expr, quotes)
-    descs, preds = zip(*(parse_one(p.strip(), expr, quotes) for p in parts))
-    return " or ".join(descs), functools.reduce(operator.or_, preds)
+    return functools.reduce(operator.or_, [parse_one(p.strip(), expr, quotes) for p in parts])
 
 
 def parse_one(line, expr, quotes=True):
@@ -146,31 +145,29 @@ def parse_one(line, expr, quotes=True):
     if m := NULL_RE.match(line):
         col, negate = m.groups()
         check_name(col, schema.names)
-        return f"{col} is {'not ' if negate else ''}null", expr[col].notnull() if negate else expr[col].isnull()
+        return expr[col].notnull() if negate else expr[col].isnull()
     if m := BETWEEN_RE.match(line):
         col, lo, hi = m.groups()
         check_name(col, schema.names)
         lo, hi = convert(schema[col], unquote(lo, quotes)), convert(schema[col], unquote(hi, quotes))
-        return f"{col} between {lo} and {hi}", expr[col].between(lo, hi)
+        return expr[col].between(lo, hi)
     if m := IN_RE.match(line):  # except는 in의 반대: 적은 값을 뺀다
         col, word, raw = m.groups()
         check_name(col, schema.names)
-        word = word.lower()
         values = [convert(schema[col], unquote(v, quotes)) for v in split(COMMA_RE, raw, quotes) if v.strip()]
-        pred = expr[col].isin(values) if word == "in" else expr[col].notin(values)
-        return f"{col} {word} ({', '.join(map(str, values))})", pred
+        return expr[col].isin(values) if word.lower() == "in" else expr[col].notin(values)
     if m := LIKE_RE.match(line):  # 포함 검색. 대소문자는 가리지 않는다
         col, raw = m.groups()
         check_name(col, schema.names)
         if not schema[col].is_string():
             raise ValueError("like는 문자 컬럼에만 쓸 수 있습니다.")
         raw = unquote(raw, quotes)
-        return f"{col} like {raw}", expr[col].lower().contains(raw.lower())
+        return expr[col].lower().contains(raw.lower())
     if m := COND_RE.match(line):
         col, op, raw = m.groups()
         check_name(col, schema.names)
         value = convert(schema[col], unquote(raw, quotes))
-        return f"{col} {op} {value}", OPS[op](expr[col], value)
+        return OPS[op](expr[col], value)
     raise ValueError(f"형식: {CONDITION_GUIDE}")
 
 
@@ -181,7 +178,7 @@ def parse_sort(line, expr):
     check_name(col, expr.columns)
     if how not in ("asc", "desc"):
         raise ValueError(f"형식: {SORT_GUIDE}")
-    return f"{col} {how}", expr[col].desc() if how == "desc" else expr[col].asc()
+    return expr[col].desc() if how == "desc" else expr[col].asc()
 
 
 # 표시 컬럼: "컬럼1, 컬럼2"
@@ -189,7 +186,7 @@ def parse_columns(line, expr):
     cols = [c.strip() for c in line.split(",") if c.strip()]
     for c in cols:
         check_name(c, expr.columns)
-    return ", ".join(cols), cols
+    return cols
 
 
 def apply(expr, preds, keys, cols):

@@ -9,7 +9,7 @@ PATH = Path(os.environ.get("APPDATA") or Path.home()) / "ibis_search" / "setting
 CHOICES = {
     "theme": ["light", "dark"],  # 화면 모드. 고른 적이 없으면 Windows 설정을 따른다.
     "ratio": ["auto", "square", "wide"],  # 차트 비율: 데이터 양에 따라 / 1:1 / 16:9
-    "image": ["light", "dark"],  # 차트 그림을 저장할 때의 모드
+    "image": ["light", "dark"],  # 차트와 집계 표를 그림으로 저장할 때의 모드
     "quotes": ["on", "off"],  # 조건을 넣을 때 따옴표 해석: 값을 감싸는 기호로 / 글자 그대로
     "cond": ["fields", "line"],  # 조건 입력 방식: 칸으로 선택 / 한 줄 입력
 }
@@ -17,8 +17,7 @@ CHOICES = {
 # 끌어서 조절한 크기(px): (최소, 최대). 화면(index.html)의 SIZES와 같아야 한다. 0을 저장하면 기본 크기로 돌아간다.
 SIZES = {"panel": (240, 640), "rows": (120, 1200), "summary": (120, 1200), "chart": (200, 1000)}
 
-
-# 직전 실행의 행당 시간(나노초/행). 작업 종류(검색·집계·차트·저장)마다 하나. 화면이 예상 시간을 구할 때 쓴다.
+# 직전 실행의 행당 시간(나노초/행). 작업 종류(검색·집계·차트·저장)마다 하나. 화면이 예상 시간을 구할 때 쓴다. 상한(MAX_TIME)은 화면(index.html)의 값과 같아야 한다.
 TIMES = ["time_search", "time_summary", "time_chart", "time_export"]
 MAX_TIME = 10**12
 
