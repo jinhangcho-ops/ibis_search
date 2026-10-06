@@ -93,18 +93,24 @@ def save_settings():
 
 @app.post("/api/files")
 def files():
+    """폴더에서 찾은 파일. files는 DuckDB 파일(하나를 골라 연다), flat은 Parquet·CSV 파일(여러 개를 골라 연다)."""
     duckdb_files, flat_files = source.find_files(request.json["path"])
-    choices = [*map(str, duckdb_files)] + ([source.ALL_FLAT] if flat_files else [])
-    if not choices:
+    if not duckdb_files and not flat_files:
         raise ValueError("DuckDB·Parquet·CSV 파일이 없습니다.")
-    return jsonify(files=choices)
+    return jsonify(files=[*map(str, duckdb_files)], flat=[*map(str, flat_files)])
 
 
 def open_con(info):
-    """연결 요청 값(folder는 path·file, url은 url·user·password)으로 연결을 연다."""
+    """연결 요청 값(folder는 path와 file 또는 files, url은 url·user·password)으로 연결을 연다.
+    file은 DuckDB 파일 하나, files는 고른 Parquet·CSV 파일들이다(파일마다 테이블 하나)."""
     if info["kind"] == "folder":
-        if info["file"] == source.ALL_FLAT:
-            return source.open_flat_files(source.find_files(info["path"])[1])
+        if "files" in info:  # 그 폴더에서 찾은 파일 중 고른 것만 연다.
+            chosen = [p for p in source.find_files(info["path"])[1] if str(p) in info["files"]]
+            if not chosen:
+                raise ValueError("Parquet·CSV 파일을 하나 이상 고르세요.")
+            return source.open_flat_files(chosen)
+        if not info.get("file"):
+            raise ValueError("파일을 고르세요.")
         return source.open_duckdb(info["file"])
     return source.open_url(info["url"], info.get("user", ""), info.get("password", ""))
 
@@ -113,7 +119,7 @@ def open_con(info):
 def connect():
     """새 연결이 실패하면 이전 연결을 다시 열어 둔다."""
     body = request.json
-    keys = ("path", "file") if body["kind"] == "folder" else ("url", "user", "password")
+    keys = ("path", "file", "files") if body["kind"] == "folder" else ("url", "user", "password")
     new, old = {"kind": body["kind"], **{k: body[k] for k in keys if k in body}}, state["opened"]
     if state["con"] is not None:  # 이전 연결을 닫아야 같은 파일을 다시 열 수 있다.
         source.close(state["con"])

@@ -7,9 +7,6 @@ import ibis
 
 import drivers
 
-ALL_FLAT = "Parquet·CSV 파일 전체"
-
-
 def find_files(folder):
     """폴더에서 DuckDB 파일과 Parquet·CSV 파일을 찾는다. 확장자는 대소문자를 가리지 않는다.
     이름이 .으로 시작하는 폴더(.venv, .git 등)는 들어가지 않는다."""

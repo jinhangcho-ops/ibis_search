@@ -55,6 +55,10 @@
   ul.items .link { color:var(--accent); font-size:12px; }
   .cols { font-size:12px; color:var(--muted); max-height:140px; overflow:auto; }
   .hidden { display:none; }
+  #flat { margin-top:6px; }
+  #flat .row { align-items:center; margin-bottom:2px; }
+  #flat-list label { display:block; white-space:nowrap; }
+  #flat-list input { width:auto; }
   /* 조건 입력 방식: 칸으로 선택(.fields)이면 한 줄 입력칸과 형식 안내를, 한 줄 입력(.line)이면 칸들을 감춘다. 조건 목록은 둘 다 같이 쓴다. */
   #cond.fields :is(#conditions .row, .format), #cond.line #builder { display:none; }
   #builder .row select { flex:1; min-width:0; }
@@ -103,6 +107,10 @@
     <div id="folder-box">
       <div class="row"><input id="path" placeholder="폴더 경로 (예: ./data)" value="."><button id="find">찾기</button></div>
       <select id="file" class="hidden"></select>
+      <div id="flat" class="hidden">
+        <div class="row"><button class="ghost" id="flat-all">모두 선택</button><button class="ghost" id="flat-none">모두 해제</button><span class="hint" id="flat-count"></span></div>
+        <div class="cols" id="flat-list"></div>
+      </div>
     </div>
     <div id="url-box" class="hidden">
       <input id="url" placeholder="mssql://host:1433/db" style="margin-bottom:6px">
@@ -251,15 +259,36 @@ document.querySelectorAll("input[name=kind]").forEach(r => r.onchange = () => {
   $("folder-box").classList.toggle("hidden", !folder);
   $("url-box").classList.toggle("hidden", folder);
 });
+// Parquet·CSV는 여러 개를 골라 연다(파일마다 테이블 하나). 파일 목록에서 이 항목을 고르면 체크 목록이 나온다.
+const FLAT = "*flat";  // 파일 이름에 쓸 수 없는 글자로 시작해 실제 경로와 겹치지 않는다.
+const flatBoxes = () => [...document.querySelectorAll("#flat-list input")];
+function showFlat() {
+  $("flat").classList.toggle("hidden", $("file").value !== FLAT);
+  $("flat-count").textContent = `${flatBoxes().filter(b => b.checked).length} / ${flatBoxes().length}개 선택`;
+}
+$("file").onchange = showFlat;
+$("flat-list").onchange = showFlat;
+$("flat-all").onclick = () => { flatBoxes().forEach(b => b.checked = true); showFlat(); };
+$("flat-none").onclick = () => { flatBoxes().forEach(b => b.checked = false); showFlat(); };
 $("find").onclick = () => busy($("find"), async () => {
-  try { fill($("file"), (await api("/api/files", { path: $("path").value })).files);
-        $("file").classList.remove("hidden"); connMsg(""); }
-  catch (e) { connMsg(e.message); }
+  try {
+    const d = await api("/api/files", { path: $("path").value });
+    fill($("file"), d.files);
+    if (d.flat.length) $("file").append(new Option(`Parquet·CSV 파일 고르기 (${d.flat.length}개)`, FLAT));
+    $("flat-list").replaceChildren(...d.flat.map(f => {  // 처음에는 아무것도 고르지 않은 상태. 쓸 파일만 체크한다.
+      const label = document.createElement("label"), box = Object.assign(document.createElement("input"), { type: "checkbox", value: f });
+      label.append(box, " " + f);
+      return label;
+    }));
+    $("file").classList.remove("hidden");
+    showFlat();
+    connMsg("");
+  } catch (e) { connMsg(e.message); }
 });
 $("connect").onclick = () => busy($("connect"), async () => {
   const kind = document.querySelector("input[name=kind]:checked").value;
   const body = kind === "folder"
-    ? { kind, path: $("path").value, file: $("file").value }
+    ? { kind, path: $("path").value, ...($("file").value === FLAT ? { files: flatBoxes().filter(b => b.checked).map(b => b.value) } : { file: $("file").value }) }
     : { kind, url: $("url").value, user: $("user").value, password: $("password").value };
   try {
     const { schemas } = await api("/api/connect", body);
