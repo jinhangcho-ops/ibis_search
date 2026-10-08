@@ -247,10 +247,13 @@ OPS = [
 ]
 
 
+OPS_NAMES = [op[0] for op in OPS]
+
+
 def apply_ops(t, name, ops):
     """컬럼 하나의 ops를 OPS의 순서대로 적용한다. 컬럼 타입은 앞 단계를 적용한 뒤의 것을 따른다."""
     for key in ops:
-        parse.check_name(key, [op[0] for op in OPS], "전처리 항목")
+        parse.check_name(key, OPS_NAMES, "전처리 항목")
     for key, kinds, valid, form, fn in OPS:
         if key not in ops:
             continue

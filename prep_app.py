@@ -8,10 +8,12 @@ import prep
 import prep_profile
 import result
 import server
+import settings
 import source
 from server import app, get_con, run, state, to_json
 
 PREVIEW_ROWS = 20
+DEFAULT_SAMPLE = 10_000  # 앞에서부터 미리 볼 행 수의 기본값
 TABLE_NAME = re.compile(r"[A-Za-z0-9_가-힣]+")
 FILE_FORMATS = ["parquet", "csv"]
 
@@ -27,13 +29,43 @@ def built(recipe):
     return run(lambda: prep.build(con, recipe))
 
 
-@app.post("/api/profile")
-def profile():
-    body = request.json
+def base_table(body):
     con, schema = get_con(), body.get("schema") or None
     parse.check_name(body["base"], source.list_tables(con, schema), "테이블")
-    table = source.get_table(con, body["base"], schema)
-    return jsonify(run(lambda: prep_profile.profile(table)))
+    return source.get_table(con, body["base"], schema)
+
+
+def sample_size(body):
+    """body의 sample(앞에서부터 미리 볼 행 수). 없으면 DEFAULT_SAMPLE."""
+    low, high = settings.SIZES["sample"]
+    n = body.get("sample", DEFAULT_SAMPLE)
+    if type(n) is not int or not low <= n <= high:
+        raise ValueError(f"미리 볼 행 수(sample)는 {low:,} 이상 {high:,} 이하의 정수로 입력하세요.")
+    return n
+
+
+@app.post("/api/shape")
+def shape():
+    """행 수와 컬럼의 이름·타입·종류. 조회는 행 수 세기뿐이다."""
+    body = request.json
+    table = base_table(body)
+    return jsonify(prep_profile.shape(table, server.row_count(body.get("schema"), body["base"])))
+
+
+@app.post("/api/profile")
+def profile():
+    """컬럼별 통계와 모양 검사가 필요 없는 추천. 글자 수는 연결이 글자 수를 세지 않으면 앞 sample행에서만 구한다(len_sampled)."""
+    body = request.json
+    table, sample, counts_chars = base_table(body), sample_size(body), server.length_counts_chars()
+    return jsonify(run(lambda: prep_profile.profile(table, sample, counts_chars)))
+
+
+@app.post("/api/patterns")
+def patterns():
+    """글자 컬럼의 타입 추천(날짜로, 숫자로, 글자를 지우고 숫자로). 앞 sample행에서 걸러 낸 뒤 전체에서 확인한다."""
+    body = request.json
+    table, sample = base_table(body), sample_size(body)
+    return jsonify(columns=run(lambda: prep_profile.patterns(table, sample)))
 
 
 @app.post("/api/preview")

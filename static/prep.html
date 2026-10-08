@@ -44,6 +44,8 @@
       <h2>2. 테이블</h2>
       <select id="schema" class="hidden" style="margin-bottom:6px"></select>
       <select id="base"></select>
+      <div class="row" style="margin-top:6px"><input id="sample" type="number" min="1000" max="1000000" style="width:120px; flex:none"><span class="err" id="err-sample" style="align-self:center"></span></div>
+      <div class="hint">통계를 낼 때 먼저 살펴보는 행 수. 날짜·숫자 모양의 추천과, Parquet·CSV 연결의 글자 길이에 씁니다.</div>
       <div class="cols" id="pcols"></div>
 
       <h2>3. 행 거르기</h2>
@@ -96,6 +98,9 @@ let dedupe = [];  // 중복 기준 (결과 컬럼 이름)
 let sorts = [];  // ["결과 컬럼 asc", ...]
 let drops = [];  // 끈 파생 컬럼 이름
 let deriv = [];  // 미리보기에서 알게 된 파생 컬럼 [{ name, source, type }]. 끈 것도 남긴다.
+let status = "";  // 통계를 구하는 단계: "stats"(통계 계산 중), "patterns"(타입 추천 확인 중), "stopped"(통계를 구하지 못함), 끝났으면 ""
+let token = 0;  // 테이블·연결이 바뀔 때마다 올려, 늦게 온 이전 테이블의 응답을 버린다
+let sample = +saved("sample") || 10000;  // 통계를 낼 때 먼저 살펴보는 행 수
 let preview = null;  // /api/preview의 응답. 열 구성이 바뀌면 어긋나므로 버린다.
 let shot = null;  // 미리보기를 누른 때의 설정(snap). 지금과 다르면 낡았다고 알린다.
 let confirming = null;  // 새 테이블 만들기를 한 번 더 누르기를 기다리는 이름
@@ -213,7 +218,7 @@ const OPS = {
 
 const newEdit = () => ({ keep: true, rename: "", ops: {} });
 // 원래 컬럼과 그 바로 뒤의 복사 컬럼들. 복사 컬럼은 원래 컬럼의 통계를 그대로 쓴다(from이 원래 컬럼 이름).
-const cols = () => prof.columns.flatMap(c => [c, ...copies.filter(x => x.from === c.name).map(x => ({ ...c, name: x.name, from: c.name, suggest: [] }))]);
+const cols = () => prof.columns.flatMap(c => [c, ...copies.filter(x => x.from === c.name).map(x => ({ ...c, name: x.name, from: c.name }))]);
 const kept = () => cols().filter(c => edits[c.name].keep);
 const outName = c => edits[c.name].rename.trim() || c.name;  // 결과에서의 컬럼 이름
 const resultNames = () => [...kept().map(outName), ...(preview ? deriv.filter(d => !drops.includes(d.name)).map(d => d.name) : [])];
@@ -272,19 +277,24 @@ function applySuggest(c, s) {
   if (s.keep === false) { e.keep = false; preview = null; }
   for (const key in s.ops) e.ops[key] = stateOf(key, s.ops[key]);
 }
-const suggests = c => c.suggest.map(s => {
+// 컬럼의 추천: 통계의 추천과 타입 추천을 합쳐, 첫 전처리가 OPS에서 나오는 순서로(뺄 것은 맨 뒤)
+const rank = s => s.keep === false ? Object.keys(OPS).length : Object.keys(OPS).indexOf(Object.keys(s.ops)[0]);
+const allSuggest = c => [...c.suggest, ...c.patterns].sort((a, b) => rank(a) - rank(b));
+const suggests = c => allSuggest(c).map(s => {
   const e = edits[c.name], done = s.keep === false ? !e.keep : Object.keys(s.ops).every(key => key in e.ops);
   return el("button", { className: "sug" + (done ? " done" : ""), onclick: () => { applySuggest(c, s); showAll(); } }, s.text, el("span", { className: "why", textContent: " " + s.why }));
 });
-$("sug-all").onclick = () => { prof.columns.forEach(c => c.suggest.forEach(s => applySuggest(c, s))); showAll(); };
+$("sug-all").onclick = () => { prof.columns.forEach(c => allSuggest(c).forEach(s => applySuggest(c, s))); showAll(); };
 // 머리글 2행의 칸: 타입(미리보기 뒤에는 바뀐 타입)과 통계. now는 미리보기의 결과 타입
 function statsHtml(c, now) {
+  const type = `<b>${esc(now && now !== c.type ? `${c.type} → ${now}` : c.type)}</b>`;
+  if (!("unique" in c)) return `<div>${type}</div><div class="empty">${status === "stopped" ? "통계를 구하지 않았습니다" : "통계 계산 중…"}</div>`;
   const rows = [
-    `<b>${esc(now && now !== c.type ? `${c.type} → ${now}` : c.type)}</b>`,
+    type,
     c.nulls ? `<b class="warn">빈 값 ${c.nulls.toLocaleString()}</b>` : "빈 값 0",
     `서로 다른 값 ${c.unique.toLocaleString()}`,
     c.min != null && `${esc(shown(c.min)[0])}–${esc(shown(c.max)[0])}`,
-    c.min_len != null && `글자 길이 ${c.min_len}–${c.max_len}`,
+    c.min_len != null && `글자 길이 ${c.min_len}–${c.max_len}${c.len_sampled ? ` (앞 ${prof.sample.toLocaleString()}행)` : ""}`,
     c.blank && `빈 문자열 ${c.blank.toLocaleString()}`,
     c.spaces && `앞뒤 공백 ${c.spaces.toLocaleString()}`,
     c.numeric && `숫자 모양 ${c.numeric.toLocaleString()}/${prof.rows.toLocaleString()}`,
@@ -317,7 +327,8 @@ function renderGrid() {
   lines.clear();
   heads.clear();
   $("shape").textContent = prof ? `행 ${prof.rows.toLocaleString()} × 컬럼 ${prof.columns.length}` : "";
-  $("sug-all").classList.toggle("hidden", !prof?.columns.some(c => c.suggest.length));
+  $("sug-all").classList.toggle("hidden", !prof?.columns.some(c => allSuggest(c).length));
+  $("sug-all").textContent = "추천 모두 적용" + (status === "patterns" ? " (타입 추천 확인 중)" : "");
   showCounts();
   if (!prof) { $("grid").innerHTML = '<span class="empty">테이블을 고르면 컬럼이 여기에 표시됩니다.</span>'; return; }
   const rows = [el("tr"), el("tr"), el("tr")], body = el("tbody"), items = gridColumns();
@@ -333,7 +344,11 @@ function renderGrid() {
     const name = el("th", { title: x.c.name }, el("div", { className: "colhead" }, el("span", { textContent: x.c.name }), copyButton(x.c)));
     heads.set(x.c.name, name);
     rows[0].append(name);
-    rows[1].append(el("th", { className: "stats", innerHTML: statsHtml(x.c, preview?.types[x.k]) }, ...suggests(x.c)));
+    rows[1].append(el("th", { className: "stats", innerHTML: statsHtml(x.c, preview?.types[x.k]) }, ...(x.c.from ? [] : [
+      ...(status === "stopped" && !("unique" in x.c) ? [el("button", { className: "ghost", textContent: "다시", title: "통계를 다시 구합니다", onclick: () => computeStats(token) })] : []),
+      ...suggests(x.c),
+      ...(status === "patterns" && isStr(x.c) ? [el("div", { className: "empty", textContent: "타입 추천 확인 중…" })] : []),
+    ])));
     rows[2].append(prepCell(x.c));
   }
   if (preview) {
@@ -398,6 +413,8 @@ function resetRun() {
 }
 // 테이블을 바꾸면(또는 연결이 바뀌면) 고른 전처리·복사·거르기·정렬 등과 미리보기를 비운다.
 function resetTable() {
+  token++;
+  status = "";
   prof = preview = shot = null;
   edits = {};
   copies = [];
@@ -418,17 +435,55 @@ function clearScreen() {
   resetTiming();
 }
 $("schema").addEventListener("change", () => { S.base = ""; resetTable(); });  // common.js가 테이블 목록을 다시 채운다.
-$("base").onchange = async () => {
-  const base = S.base = $("base").value;
+// 테이블을 고른 것과 같게 한다(목록에서 고를 때, ?base=). ①모양(이름·타입)을 바로 보이고 ②통계 ③타입 추천을 차례로 채운다.
+// 모든 단계가 끝나면 status가 ""이고 이 함수의 Promise가 끝난다.
+async function openTable(base) {
+  S.base = base;
   resetTable();
   if (!base) return;
+  const mine = token;
   try {
-    const p = await timed("profile", () => api("/api/profile", { schema: S.schema, base }));
-    if (base !== S.base) return;  // 불러오는 사이 다른 테이블을 골랐으면 버린다.
-    prof = p;
+    const p = await timed("profile", () => api("/api/shape", { schema: S.schema, base }));
+    if (mine !== token) return;
+    prof = { ...p, columns: p.columns.map(c => ({ ...c, suggest: [], patterns: [] })) };
     edits = Object.fromEntries(p.columns.map(c => [c.name, newEdit()]));
     showAll();
-  } catch (e) { fail(e.message); }
+  } catch (e) { if (mine === token) fail(e.message); return; }
+  await computeStats(mine);
+}
+// ②와 ③. 오류나 취소로 ②가 멈추면 통계 칸에 "구하지 않았습니다"와 [다시]가 나온다.
+async function computeStats(mine) {
+  const body = { schema: S.schema, base: S.base, sample };
+  status = "stats";
+  prof.sample = sample;
+  renderGrid();
+  try {
+    const p = await timed("profile", () => api("/api/profile", body));
+    if (mine !== token) return;
+    const byName = Object.fromEntries(p.columns.map(c => [c.name, c]));
+    prof.columns.forEach(c => Object.assign(c, byName[c.name]));
+    status = prof.columns.some(isStr) ? "patterns" : "";
+    renderGrid();
+    if (!status) return;
+    const d = await timed("profile", () => api("/api/patterns", body));
+    if (mine !== token) return;
+    prof.columns.forEach(c => c.patterns = d.columns[c.name] ?? []);
+    status = "";
+    renderGrid();
+  } catch (e) {
+    if (mine !== token) return;
+    status = status === "stats" ? "stopped" : "";
+    fail(e.message);
+    renderGrid();
+  }
+}
+$("base").onchange = () => openTable($("base").value);
+$("sample").value = sample;
+$("sample").onchange = () => {
+  const n = Number($("sample").value);
+  const ok = Number.isInteger(n) && n >= 1000 && n <= 1000000;
+  $("err-sample").textContent = ok ? "" : "1,000–1,000,000 사이의 정수를 넣으세요.";
+  if (ok) { sample = n; saveSetting({ sample }); }
 };
 
 // 서버로 보낼 레시피. 할 일이 있는 컬럼만 넣는다. 입력이 비어 쓸 수 없는 전처리가 있으면 그 줄을 표시하고 멈춘다.

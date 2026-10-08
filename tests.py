@@ -92,7 +92,18 @@ MESSY = {
     "b8": [127] + [-128] * 19,
     "b16": [128] + [0] * 19,
 }
+# 앞 1,000행과 전체가 다른 표(모양 검사를 앞부분으로 거르는 것을 확인한다) 3,000행.
+WIDE = {
+    "n": list(range(3000)),
+    "num_all": [str(i) for i in range(3000)],  # 전체가 숫자 모양
+    "num_late": ["x" if i == 2500 else str(i) for i in range(3000)],  # 앞은 숫자 모양, 뒤에 글자
+    "bad_head": ["x" if i == 0 else str(i) for i in range(3000)],  # 앞에 글자
+    "date_late": [("" if i % 2 else None) if i < 1500 else "20260101" for i in range(3000)],  # 앞 1,500행은 모두 빈 값, 뒤는 날짜 모양
+    "kor": ["가나다" if i % 2 == 0 else "한글입니다" for i in range(3000)],  # 글자 수 3, 5(바이트 수가 아니다)
+}
+BAD = {"s": ["x" if i % 2 else "y" for i in range(1100)]}  # 모양 후보가 하나도 없는 표
 DATA, PREP, PREP_FLAT = ROOT / "data", ROOT / "prep", ROOT / "prep_flat"
+SAMPLING, SAMPLING_FLAT = ROOT / "sampling", ROOT / "sampling_flat"
 fails, done = [], []
 
 
@@ -118,6 +129,15 @@ def make_data():
     con.execute('create table messy as select * replace (cast("at" as time) as "at") from frame')  # Polars의 시간은 나노초라 DuckDB의 time으로 바꾼다.
     con.close()
     frame.write_parquet(PREP_FLAT / "messy.parquet")
+    SAMPLING.mkdir()
+    SAMPLING_FLAT.mkdir()
+    wide, bad = pl.DataFrame(WIDE), pl.DataFrame(BAD)
+    con = duckdb.connect(str(SAMPLING / "sampling.duckdb"))
+    con.execute("create table wide as select * from wide")
+    con.execute("create table bad as select * from bad")
+    con.close()
+    wide.write_parquet(SAMPLING_FLAT / "wide.parquet")
+    bad.write_parquet(SAMPLING_FLAT / "bad.parquet")
 
 
 def check(name, got, want):
@@ -290,7 +310,10 @@ def prep_new(tag, got, error, only, preview, values):
     check(tag + " dedupe 뒤에 downcast", r["types"], ["int8", "float32"])
 
     print("== 추천:", tag)
-    suggest = {c["name"]: c["suggest"] for c in got("/api/profile", base="messy")["columns"]}
+    patterns = got("/api/patterns", base="messy")["columns"]
+    order = lambda s: min((prep_ops.OPS_NAMES.index(k) for k in s.get("ops", {})), default=len(prep_ops.OPS_NAMES))  # 화면이 하는 것처럼 op 순서로 합친다.
+    suggest = {c["name"]: sorted(c["suggest"] + patterns.get(c["name"], []), key=order) for c in got("/api/profile", base="messy")["columns"]}
+    check(tag + " /api/patterns: 추천이 없는 컬럼은 키가 없음, 문자 컬럼만", sorted(patterns), ["born", "decs", "iso_dt", "isod", "money", "numstr"])
     what = lambda col: [s["ops"] if "ops" in s else {"keep": s["keep"]} for s in suggest[col]]
     want = {
         "id": [], "flag": [], "name": [{"trim": True}],
@@ -318,6 +341,42 @@ def prep_new(tag, got, error, only, preview, values):
     broken = [(col, i) for col, found in suggest.items() for i, s in enumerate(found) if "ops" in s
               and "error" in got("/api/preview", base="messy", columns=only(col, **{col: {"ops": s["ops"]}}))]
     check(tag + " 추천의 ops를 그대로 recipe에 넣으면 동작", broken, [])
+
+
+def prep_sampling(pc, got, error):
+    """통계·모양 검사를 앞 sample행으로 줄이는 것. 같은 검사를 DuckDB 파일 연결과 Parquet 연결에 돌린다."""
+    duck = got("/api/files", path=str(SAMPLING))["files"][0]
+    flat = got("/api/files", path=str(SAMPLING_FLAT))["flat"]
+    calls, original = [], prep_profile.measure
+    prep_profile.measure = lambda t, wanted: (calls.append(wanted), original(t, wanted))[1]  # 모양을 검사한 조회를 센다.
+    try:
+        for tag, connect in [("DuckDB", dict(kind="folder", path=str(SAMPLING), file=duck)), ("Parquet", dict(kind="folder", path=str(SAMPLING_FLAT), files=flat))]:
+            print("== 앞 sample행으로 거르기:", tag)
+            got("/api/connect", **connect)
+            r = got("/api/shape", base="wide")
+            check(tag + " /api/shape", (r["rows"], [(c["name"], c["type"], c["kind"]) for c in r["columns"]]),
+                  (3000, [("n", "int64", "int"), ("num_all", "string", "string"), ("num_late", "string", "string"), ("bad_head", "string", "string"),
+                          ("date_late", "string", "string"), ("kor", "string", "string")]))
+            check(tag + " sample 범위·형식 거부", [error(api, base="wide", sample=v) for api in ("/api/profile", "/api/patterns") for v in (999, 1_000_001, "5000", 1500.0)],
+                  ["미리 볼 행 수(sample)는 1,000 이상 1,000,000 이하의 정수로 입력하세요."] * 8)
+            check(tag + " sample 안 주면 기본값, 경계값은 됨", ("rows" in got("/api/profile", base="wide"), "rows" in got("/api/profile", base="wide", sample=1000),
+                  "columns" in got("/api/patterns", base="wide", sample=1_000_000)), (True, True, True))
+            kor = next(c for c in got("/api/profile", base="wide", sample=1000)["columns"] if c["name"] == "kor")
+            check(tag + " 한글 값의 글자 수(바이트 수가 아님), len_sampled는 글자 수를 못 세는 연결에만", ({k: kor[k] for k in ("min_len", "max_len")}, kor.get("len_sampled")),
+                  ({"min_len": 3, "max_len": 5}, True if tag == "Parquet" else None))
+            calls.clear()
+            r = got("/api/patterns", base="wide", sample=1000)["columns"]
+            check(tag + " patterns: 앞부분만 맞는 컬럼은 전체에서 걸러짐, 앞이 모두 빈 값이면 전체에서 확인해 추천", {k: [s["ops"] for s in v] for k, v in r.items()},
+                  {"num_all": [{"type": {"to": "int"}}], "date_late": [{"type": {"to": "date", "format": "%Y%m%d"}}]})
+            check(tag + " patterns: why의 개수는 전체 기준", [s["why"] for k in ("num_all", "date_late") for s in r[k]],
+                  ["빈 값과 빈 값 표시를 뺀 3,000개가 모두 숫자로 바뀝니다.", "빈 값과 빈 값 표시를 뺀 1,500개가 모두 YYYYMMDD 모양입니다."])
+            check(tag + " patterns: 앞에서 걸러진 컬럼(bad_head)은 전체 조회에 넣지 않고, 전체에서 틀린 컬럼(num_late)만 다음 모양을 확인", [sorted(w) for w in calls],
+                  [["bad_head", "date_late", "kor", "num_all", "num_late"], ["date_late", "num_all", "num_late"], ["num_late"]])
+            calls.clear()
+            check(tag + " patterns: 후보가 없으면 전체 조회를 보내지 않음", (got("/api/patterns", base="bad", sample=1000), len(calls)), ({"columns": {}}, 1))
+    finally:
+        prep_profile.measure = original
+    got("/api/disconnect")
 
 
 def prep_section():
@@ -415,7 +474,7 @@ def prep_section():
             stat("flag", "boolean", "bool", 0, 2),
         ]
         for w, g in zip(want, profile["columns"]):
-            check(f"{tag} profile: {w['name']}", {k: v for k, v in g.items() if k != "suggest"}, w)
+            check(f"{tag} profile: {w['name']}", {k: v for k, v in g.items() if k not in ("suggest", "len_sampled")}, w)
         for name, col, o, want in cases:
             check(f"{tag} {name}", values(preview(ops(col, **o)), col), want)
         r = preview(ops("score", fill={"how": "mean"}))
@@ -478,6 +537,7 @@ def prep_section():
     r = got("/api/preview", schema="main", base="from_url", sorts=["id desc"])
     check("주소 연결에서 만든 테이블의 값", (values(r, "name")[:2], r["before"]), (["Eve  Smith", "dave"], 20))
     got("/api/disconnect")
+    prep_sampling(pc, got, error)
 
 
 def sqlite_section(c, got):
