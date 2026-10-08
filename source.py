@@ -1,5 +1,7 @@
 """데이터 연결. 폴더의 파일을 열거나, 연결 주소로 DB에 접속한다."""
+import functools
 import os
+import queue
 import re
 import threading
 from pathlib import Path
@@ -8,6 +10,73 @@ from urllib.parse import quote_plus, unquote, urlsplit
 import ibis
 
 import drivers
+
+STOP_WAIT = 2  # 멈추라고 알린 일이 실제로 끝나기를 기다리는 시간(초).
+
+# 연결을 쓰는 일은 모두 스레드 하나(worker)에서 차례로 돌린다. 만든 스레드에서만 쓸 수 있는 연결(SQLite 등)이 있어서다.
+worker, jobs = None, None
+
+
+def start_worker():
+    """일감 줄과 그 줄의 일을 차례로 돌리는 스레드를 새로 만든다. 줄에 None이 오면 그 스레드는 끝난다."""
+    global worker, jobs
+    jobs = todo = queue.SimpleQueue()
+
+    def loop():
+        for job in iter(todo.get, None):
+            job()
+
+    worker = threading.Thread(target=loop, daemon=True)  # daemon: 일이 도는 중에 프로그램을 꺼도 붙잡지 않는다.
+    worker.start()
+
+
+start_worker()
+
+
+def within(seconds, work, late, wake=None, drop=lambda value: None, stop=lambda: False):
+    """work()를 연결 스레드에서 돌려 seconds초까지만 기다린다(None이면 끝까지). DB 종류와 상관없이 쓸 수 있게 드라이버 설정 대신 이렇게 한다.
+    넘기면 late 문구로 TimeoutError, 기다리는 중에 밖에서 wake를 켜면 InterruptedError를 낸다.
+    그만둘 때 stop()을 부르고, 멈추라고 알렸으면(True) 일이 끝나기를 STOP_WAIT초까지 기다린다. 그래도 안 끝나거나 알릴 수 없으면
+    그 스레드는 하던 일에 두고 새 스레드로 넘어가 다음 일이 막히지 않게 한다. 포기한 뒤에 늦게 나온 결과는 drop에 넘긴다(연결이면 닫는다)."""
+    if threading.current_thread() is worker:  # 연결 스레드 안에서 부른 일은 그 자리에서 돌린다.
+        return work()
+    found, gave_up, ended, lock, wake = {}, threading.Event(), threading.Event(), threading.Lock(), wake or threading.Event()
+
+    def run():
+        try:
+            value = {"value": work()}
+        except Exception as e:
+            value = {"error": e}
+        with lock:  # 포기와 끝이 겹쳐도 결과는 돌려주거나 버리거나 둘 중 하나만 한다.
+            if not gave_up.is_set():
+                found.update(value)
+            elif "value" in value:
+                try:
+                    drop(value["value"])
+                except Exception:
+                    pass
+        ended.set()
+        wake.set()
+
+    jobs.put(run)
+    timed_out = not wake.wait(seconds)
+    with lock:
+        if not found:
+            gave_up.set()
+    if gave_up.is_set():
+        if not (stop() and ended.wait(STOP_WAIT)):
+            jobs.put(None)
+            start_worker()
+        raise TimeoutError(late) if timed_out else InterruptedError()
+    if "error" in found:
+        raise found["error"]
+    return found["value"]
+
+
+def on_worker(f):
+    """f를 연결 스레드에서 돌리게 한다. 연결을 만들고 쓰고 닫는 함수에 붙인다."""
+    return functools.wraps(f)(lambda *args, **kwargs: within(None, lambda: f(*args, **kwargs), ""))
+
 
 def find_files(folder):
     """폴더에서 DuckDB 파일과 Parquet·CSV 파일을 찾는다. 확장자는 대소문자를 가리지 않는다.
@@ -22,6 +91,7 @@ def find_files(folder):
     return duckdb_files, flat_files
 
 
+@on_worker
 def open_duckdb(path, read_only=True):
     return ibis.duckdb.connect(path, read_only=read_only)
 
@@ -45,6 +115,7 @@ def table_names(paths):
     return names
 
 
+@on_worker
 def open_flat_files(paths):
     """Parquet·CSV 파일을 Polars 백엔드(LazyFrame)에 table_names의 이름으로 등록한다."""
     con = ibis.polars.connect()
@@ -55,33 +126,6 @@ def open_flat_files(paths):
 
 
 CONNECT_TIMEOUT = 60  # 주소로 접속할 때 기다리는 시간(초). 틀린 주소에서 드라이버가 몇 분씩 붙잡는 것을 막는다.
-
-
-def within(seconds, work, late, wake=None, drop=lambda value: None):
-    """work()를 따로 돌려 seconds초까지만 기다린다. DB 종류와 상관없이 쓸 수 있게 드라이버 설정 대신 이렇게 한다.
-    넘기면 late 문구로 TimeoutError, 기다리는 중에 밖에서 wake를 켜면 InterruptedError를 낸다.
-    포기한 뒤에 늦게 나온 결과는 drop에 넘긴다(연결이면 닫는다)."""
-    found, gave_up, wake = {}, threading.Event(), wake or threading.Event()
-
-    def run():
-        try:
-            found["value"] = work()
-        except Exception as e:
-            found["error"] = e
-        if gave_up.is_set() and "value" in found:
-            drop(found["value"])
-        wake.set()
-
-    threading.Thread(target=run, daemon=True).start()  # daemon: 기다리는 중에 프로그램을 꺼도 붙잡지 않는다.
-    timed_out = not wake.wait(seconds)
-    if not found:
-        gave_up.set()
-        if "value" in found:  # 포기하는 순간에 끝난 경우
-            drop(found["value"])
-        raise TimeoutError(late) if timed_out else InterruptedError()
-    if "error" in found:
-        raise found["error"]
-    return found["value"]
 
 
 def open_url(url, user="", password=""):
@@ -96,6 +140,7 @@ def open_url(url, user="", password=""):
     return within(CONNECT_TIMEOUT, lambda: ibis.connect(url, **extra), late, drop=close)
 
 
+@on_worker
 def close(con):
     """연결을 닫아 파일·접속을 놓는다. 닫기를 지원하지 않는 백엔드는 그냥 둔다."""
     try:
@@ -105,25 +150,31 @@ def close(con):
 
 
 def interrupt(con):
-    """연결이 돌리고 있는 작업을 멈추라고 드라이버에 알린다. 드라이버 연결(con.con)에 interrupt나 cancel이 있을 때만, 되는 만큼만 한다."""
+    """연결이 돌리고 있는 작업을 멈추라고 드라이버에 알린다. 드라이버 연결(con.con)에 interrupt나 cancel이 있을 때만, 되는 만큼만 한다.
+    알렸으면 True. 다른 스레드에서 부르는 것이라 연결 스레드로 보내지 않는다."""
     raw = getattr(con, "con", None)
     stop = getattr(raw, "interrupt", None) or getattr(raw, "cancel", None)
     try:
         if stop:
             stop()
+            return True
     except Exception:
         pass
+    return False
 
 
+@on_worker
 def list_schemas(con):
     """스키마 목록. 지원하지 않는 백엔드(Polars 등)는 빈 목록."""
     return sorted(con.list_databases()) if hasattr(con, "list_databases") else []
 
 
+@on_worker
 def list_tables(con, schema=None):
     return con.list_tables(database=schema) if schema else con.list_tables()
 
 
+@on_worker
 def get_table(con, name, schema=None):
     return con.table(name, database=schema) if schema else con.table(name)
 

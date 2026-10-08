@@ -11,6 +11,7 @@ import random
 import re
 import math
 import shutil
+import sqlite3
 import statistics
 import sys
 import tempfile
@@ -104,6 +105,12 @@ def make_data():
     con.close()
     pl.DataFrame(customers[:5]).write_parquet(DATA / "flat" / "buyers.parquet")
     pl.DataFrame(orders[:5]).write_csv(DATA / "flat" / "sales.csv")
+    con = sqlite3.connect(DATA / "shop.db")  # SQLite에는 날짜 타입이 없어 날짜는 글자로 들어간다.
+    for name, rows in (("customers", customers), ("orders", orders)):
+        con.execute(f"create table {name} ({', '.join(k + (' integer' if isinstance(v, int) else ' text') for k, v in rows[0].items())})")
+        con.executemany(f"insert into {name} values ({', '.join('?' * len(rows[0]))})", [[v if v is None or isinstance(v, int) else str(v) for v in row.values()] for row in rows])
+    con.commit()
+    con.close()
     PREP.mkdir()
     PREP_FLAT.mkdir()
     frame = pl.DataFrame(MESSY)
@@ -473,6 +480,45 @@ def prep_section():
     got("/api/disconnect")
 
 
+def sqlite_section(c, got):
+    """SQLite 주소 연결. 이 연결은 만든 스레드에서만 쓸 수 있어, 연결을 쓰는 일이 모두 한 스레드에서 도는지 여기서 드러난다."""
+    print("== SQLite 주소 연결")
+    n = lambda keep: sum(1 for o in orders if keep(o))
+    tables = lambda: sorted(c.get("/api/tables").get_json().get("tables", []))
+    check("SQLite 연결", got("/api/connect", kind="url", url=f"sqlite://{DATA / 'shop.db'}"), {"schemas": ["main"]})
+    check("SQLite 테이블 목록", tables(), ["customers", "orders"])
+    check("SQLite /api/state", c.get("/api/state").get_json()["schemas"], ["main"])
+    r = got("/api/query", base="orders", joins=["customers left customer_id=id"], conditions=["status = paid", "amount >= 20000"], sorts=["order_id"], columns=["order_id, name"], limit=3)
+    mine = [o for o in orders if o["status"] == "paid" and o["amount"] >= 20000]
+    names = {p["id"]: p["name"] for p in customers}
+    check("SQLite 검색(조인·조건·정렬·표시 컬럼)", r, {"count": len(mine), "rows": {"columns": ["order_id", "name"],
+          "rows": [{"order_id": o["order_id"], "name": names.get(o["customer_id"])} for o in mine[:3]]}})
+    check("SQLite 행 수·값 목록", (got("/api/rowcount", base="orders"), got("/api/values", base="orders", column="status")),
+          ({"rows": len(orders)}, {"values": sorted(STATUSES), "more": False}))
+    rows = {row["name"]: row for row in got("/api/summary", base="orders")["summary"]["rows"]}
+    amounts = [o["amount"] for o in orders]
+    check("SQLite 집계", (list(rows), rows["amount"]["min"], rows["amount"]["max"], round(rows["amount"]["mean"], 6), rows["note"]["nulls"]),
+          (list(orders[0]), min(amounts), max(amounts), round(sum(amounts) / len(amounts), 6), n(lambda o: o["note"] is None)))
+    sizes = Counter(o["status"] for o in orders)
+    r = got("/api/chart", base="orders", x="status", series=[{"agg": "count"}])
+    check("SQLite 차트", (r["labels"], r["datasets"][0]["values"]), (sorted(STATUSES), [sizes[s] for s in sorted(STATUSES)]))
+    data = c.post("/api/export", json={"base": "orders", "sorts": ["order_id"], "columns": ["order_id"], "format": "csv"}).data
+    check("SQLite CSV 저장", len(data.decode("utf-8").splitlines()), len(orders) + 1)
+    recipe = {"base": "customers", "columns": {"name": {"ops": {"case": "upper"}}}, "sorts": ["id"]}
+    r = got("/api/preview", **recipe)
+    check("SQLite 전처리 미리보기", ([row["name"] for row in r["rows"]["rows"]], r["before"], r["after"]), ([p["name"].upper() for p in customers[:20]], 40, 40))
+    check("SQLite 새 테이블 만들기", (got("/api/run", recipe=recipe, target={"kind": "table", "name": "upper_names"}), tables()),
+          ({"ok": True, "rows": 40}, ["customers", "orders", "upper_names"]))
+    check("SQLite 만든 테이블의 값", got("/api/query", base="upper_names", sorts=["id"], columns=["name"], limit=1, count=False)["rows"]["rows"], [{"name": "CUSTOMER01"}])
+    thread, forever = source.worker, "with recursive n(i) as (select 1 union all select i + 1 from n) select count(*) from n"
+    threading.Timer(0.3, lambda: c.post("/api/cancel")).start()
+    check("SQLite 취소: 끝나지 않는 조회가 멈춤", raised(lambda: server.run(lambda: state["con"].con.execute(forever).fetchall())), "ValueError")
+    check("SQLite 취소 뒤에도 같은 스레드, 같은 연결로 검색", (source.worker is thread, got("/api/query", base="orders")["count"]), (True, len(orders)))
+    check("SQLite 다른 연결로 바꿨다가 돌아오기", (got("/api/connect", kind="folder", path=str(DATA), file=str(DATA / "shop.duckdb")).get("schemas") is not None,
+          got("/api/connect", kind="url", url=f"sqlite://{DATA / 'shop.db'}"), tables()), (True, {"schemas": ["main"]}, ["customers", "orders", "upper_names"]))
+    check("SQLite 연결 해제", (got("/api/disconnect"), c.get("/api/tables").get_json()), ({"ok": True}, {"error": "먼저 연결하세요."}))
+
+
 def main():
     make_data()
     c = app.test_client()
@@ -659,6 +705,15 @@ def main():
     check("within: 밖에서 깨우면 InterruptedError", raised(lambda: source.within(5, lambda: time.sleep(0.3), "늦음", wake)), "InterruptedError")
     check("/api/disconnect", got("/api/disconnect"), {"ok": True})
     check("연결을 끊은 뒤", c.get("/api/tables").get_json(), {"error": "먼저 연결하세요."})
+    thread = source.worker
+    check("within: 연결 스레드에서 돌고, 그 안에서 부른 일도 같은 스레드", source.within(1, lambda: (threading.current_thread(), source.within(1, threading.current_thread, "늦음")), "늦음"), (thread, thread))
+    late = []
+    check("within: 멈출 수 없는 일은 두고 새 스레드로 넘어가 다음 일이 막히지 않음",
+          (raised(lambda: source.within(0.05, lambda: time.sleep(0.5) or "늦은 결과", "늦음", drop=late.append)), source.worker is thread, source.within(0.2, lambda: "다음", "늦음")),
+          ("TimeoutError", False, "다음"))
+    thread.join(2)
+    check("within: 두고 온 일의 늦은 결과는 drop으로 가고 그 스레드는 끝남", (late, thread.is_alive()), (["늦은 결과"], False))
+    sqlite_section(c, got)
     prep_section()
 
 

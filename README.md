@@ -629,7 +629,7 @@ pip install 'ibis-framework[mssql]'      # [] 안은 DB 이름: oracle, clickhou
 | DB | 주소 예 | 따로 설치할 것 |
 |---|---|---|
 | DuckDB | `duckdb://data.duckdb` | 없음 |
-| SQLite | `sqlite://data.db` | 없음. 지금은 연결되지 않습니다(고칠 예정) |
+| SQLite | `sqlite://data.db` | 없음 |
 | MSSQL | `mssql://host:1433/db` | [ODBC Driver 17/18 for SQL Server](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server) |
 | PostgreSQL | `postgres://host:5432/db` | 없음 |
 | MySQL | `mysql://host:3306/db` | 없음 |
