@@ -1,0 +1,79 @@
+:root { --bg:#f4f5f7; --card:#fff; --head:#f9fafb; --line:#dde1e6; --text:#1f2933; --muted:#6b7480; --accent:#2f5bea; --err:#c62828; --ok:#2e7d32; color-scheme:light;
+        --c1:#2f5bea; --c2:#e8590c; --c3:#2b8a3e; --c4:#c2255c; --c5:#7048e8; --c6:#0c8599; --c7:#e67700; --c8:#5c7080; }
+:root[data-theme=dark] { --bg:#15171c; --card:#1e2128; --head:#262a33; --line:#343945; --text:#e6e8ec; --muted:#9aa3b2; --accent:#4a72f0; --err:#ef6b6b; --ok:#66bb6a; color-scheme:dark;
+        --c1:#5b8cff; --c2:#ff922b; --c3:#51cf66; --c4:#f06595; --c5:#9775fa; --c6:#3bc9db; --c7:#fcc419; --c8:#adb5bd; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
+.layout { display:grid; grid-template-columns:var(--panel, 340px) 16px 1fr; padding:16px; min-height:100vh; }
+.panel, .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
+/* 끌어서 크기를 바꾸는 경계. 패널 오른쪽 틈(.grip-x)과 카드 아래쪽 가장자리(.grip-y). 더블클릭하면 기본 크기.
+   [크기 조절]을 켰을 때(.resizing)만 잡히고 옅게 보이며, 올리거나 끄는 동안 진해진다. 꺼져 있으면 없는 것과 같다. */
+.card { position:relative; }
+.grip-x { position:sticky; top:0; height:100vh; margin:-16px 0; cursor:col-resize; --grip:0%; pointer-events:none;
+  background:linear-gradient(to right, transparent 6px, color-mix(in srgb, var(--accent) var(--grip), transparent) 6px 10px, transparent 10px); }
+.grip-y { position:absolute; left:0; right:0; bottom:0; height:10px; border-radius:0 0 8px 8px; cursor:row-resize; --grip:0%; pointer-events:none;
+  background:color-mix(in srgb, var(--accent) var(--grip), transparent); }
+.resizing :is(.grip-x, .grip-y) { --grip:25%; pointer-events:auto; }
+.resizing :is(.grip-x, .grip-y):is(:hover, .on) { --grip:70%; }
+.panel { align-self:start; position:sticky; top:16px; max-height:calc(100vh - 32px); overflow:auto; }
+.main { display:flex; flex-direction:column; gap:16px; min-width:0; }
+h2 { font-size:13px; margin:14px 0 6px; color:var(--muted); }
+h2:first-child { margin-top:0; }
+h3 { font-size:15px; margin:0 0 10px; }
+input, select, button { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; width:100%; }
+input, select { background:var(--card); color:var(--text); }
+#theme, #resize, #cancel { float:right; }
+#cancel { font-size:12px; }  /* 시간 줄(12px)과 같은 높이라 나타나도 줄 높이가 변하지 않는다. */
+#usage, #timing { margin:0; font-variant-numeric:tabular-nums; }
+#usage { clear:both; }  /* 버튼 아래 줄에서 시작. 좁으면 "|" 앞에서만 줄을 바꾼다. */
+#usage span { white-space:nowrap; }
+#timing { margin-bottom:6px; }
+button { background:var(--accent); color:#fff; border:none; cursor:pointer; width:auto; padding:6px 12px; flex:none; white-space:nowrap; }
+button:disabled { opacity:.55; cursor:wait; }
+.row input { flex:1; min-width:0; }
+.ok { color:var(--ok); font-size:12px; min-height:16px; }
+button.ghost { background:none; color:var(--muted); padding:0 6px; }
+.row { display:flex; gap:6px; margin-bottom:6px; }
+.tabs label { margin-right:12px; }
+.pages { display:flex; gap:6px; margin-bottom:10px; }  /* 검색·전처리 전환. 지금 화면은 .on */
+.pages a { padding:4px 14px; border:1px solid var(--line); border-radius:6px; color:var(--text); text-decoration:none; }
+.pages a.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+.hint { color:var(--muted); font-size:12px; margin:2px 0 6px; }
+.err { color:var(--err); font-size:12px; min-height:16px; }
+.cols { font-size:12px; color:var(--muted); max-height:140px; overflow:auto; }
+.hidden { display:none; }
+#flat { margin-top:6px; }
+#flat .row { align-items:center; margin-bottom:2px; }
+#flat-list label { display:block; white-space:nowrap; }
+#flat-list input { width:auto; }
+/* 카드 제목 줄: 제목 옆에 버튼과 고르는 칸, 그 오른쪽에 고른 것들(칩)이 한 줄로 놓인다. */
+.head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:10px; }
+.head h3 { margin:0; flex:none; }
+.head select { width:auto; max-width:200px; flex:none; }
+.chips { display:flex; flex:1 1 160px; min-width:0; gap:4px; align-items:center; overflow:hidden; }
+.chips.open { flex-wrap:wrap; }
+.chips .hint { margin:0; white-space:nowrap; }
+.chip { flex:none; background:var(--bg); border-radius:6px; padding:2px 2px 2px 8px; font-size:12px; white-space:nowrap; }
+.chip.more { padding:2px 8px; color:var(--accent); cursor:pointer; }
+/* 표 높이: 끌어서 정하기 전에는 내용만큼(최대 420px), 정한 뒤에는 그 높이 그대로. */
+.table-wrap { overflow:auto; max-height:420px; }
+table { border-collapse:collapse; font-size:12px; white-space:nowrap; }
+th, td { border-bottom:1px solid var(--line); padding:4px 10px; text-align:left; }
+th { position:sticky; top:0; background:var(--head); }
+td.num { text-align:right; font-variant-numeric:tabular-nums; }
+.empty { color:var(--muted); }
+/* 고르는 칸을 펼친 목록. 창 엔진이 그리는 목록은 화면 모드의 색을 따르지 않아 직접 그린다(맨 아래 스크립트). */
+.menu { position:fixed; z-index:100; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:4px 0; box-shadow:0 6px 18px rgb(0 0 0 / .25); }
+.menu input { display:block; width:calc(100% - 12px); margin:2px 6px 4px; }
+.menu > div { overflow:auto; }
+.menu div div { padding:5px 10px; white-space:nowrap; cursor:default; }
+.menu div div.now { color:var(--accent); }
+.menu div div.on { background:var(--bg); }
+/* 스크롤바(전역): 어디서나 같은 모양. 얇고 반투명하며 화살표 버튼과 바탕이 없다.
+   창 엔진의 겹침 스크롤바는 마우스가 닿으면 화살표 달린 두꺼운 모양으로 바뀌고 스타일로 막을 수 없어, 모양을 직접 정한다. */
+::-webkit-scrollbar { width:8px; height:8px; }
+::-webkit-scrollbar-button { display:none; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background:transparent; }
+::-webkit-scrollbar-thumb { background:color-mix(in srgb, var(--text) 30%, transparent); border-radius:4px; }
+::-webkit-scrollbar-thumb:hover { background:color-mix(in srgb, var(--text) 50%, transparent); }
+@media (max-width:800px) { .layout { grid-template-columns:1fr; gap:16px; } .panel { position:static; max-height:none; } .grip-x { display:none; } }

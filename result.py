@@ -49,6 +49,11 @@ def get_count(expr):
     return expr.count().to_pyarrow().as_py()
 
 
+def plain(value):
+    """JSON으로 보낼 수 있는 값. 숫자와 빈 값은 그대로, Decimal은 실수로, 나머지(날짜 등)는 글자로."""
+    return value if value is None or isinstance(value, (int, float)) else float(value) if isinstance(value, Decimal) else str(value)
+
+
 def get_summary(expr, columns=()):
     """컬럼별 집계를 조회 한 번으로 계산해 SUMMARY_COLS 모양의 줄들로 돌려준다. columns를 주면 그 컬럼만 그 순서로.
     개수(빈 값 제외)·빈 값·고유값은 모든 컬럼, 최소·최대는 숫자와 날짜, 평균은 숫자만 계산한다."""
@@ -66,7 +71,6 @@ def get_summary(expr, columns=()):
         if numeric:
             metrics[f"mean{i}"] = col.mean()
     found = expr.aggregate(**metrics).to_polars().row(0, named=True)
-    plain = lambda v: v if v is None or isinstance(v, (int, float)) else float(v) if isinstance(v, Decimal) else str(v)
     return [{"name": name, "type": str(expr.schema()[name]).lstrip("!"), "count": found[f"count{i}"], "nulls": found[f"nulls{i}"] or 0,
              "unique": found[f"unique{i}"], **{k: plain(found.get(f"{k}{i}")) for k in ("min", "max", "mean")}}
             for i, name in enumerate(kinds)]
@@ -118,12 +122,13 @@ def get_chart(expr, x, series, split=None, order="x"):
                     for i in range(len(series)) for part in parts], more
 
 
-def export(expr, path):
-    """조건에 맞는 전체 행을 파일로 저장한다. 형식은 확장자(.csv, .xlsx, .parquet)로 정한다."""
+def export(expr, path, guard=True):
+    """조건에 맞는 전체 행을 파일로 저장한다. 형식은 확장자(.csv, .xlsx, .parquet)로 정한다.
+    guard가 False면 수식 막기를 하지 않는다(다시 데이터로 읽을 파일)."""
     suffix = Path(path).suffix.lower()
     if suffix not in EXPORTS:
         raise ValueError(f"파일 이름은 {', '.join(EXPORTS)} 중 하나로 끝나야 합니다.")
-    if suffix != ".parquet":  # 수식으로 읽힐 글자로 시작하는 문자 값은 앞에 '를 붙여 스프레드시트가 실행하지 않게 한다.
+    if guard and suffix != ".parquet":  # 수식으로 읽힐 글자로 시작하는 문자 값은 앞에 '를 붙여 스프레드시트가 실행하지 않게 한다.
         texts = [name for name, t in expr.schema().items() if t.is_string()]
         expr = expr.mutate(**{name: expr[name].re_search(r"^[=+\-@\t\r]").ifelse("'" + expr[name], expr[name]) for name in texts})
     EXPORTS[suffix](expr, path)

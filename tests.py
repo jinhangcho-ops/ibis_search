@@ -9,7 +9,9 @@ import io
 import os
 import random
 import re
+import math
 import shutil
+import statistics
 import sys
 import tempfile
 import threading
@@ -26,11 +28,17 @@ os.environ["APPDATA"] = str(ROOT / "appdata")
 sys.dont_write_bytecode = True  # 프로젝트 폴더에 __pycache__를 남기지 않는다.
 
 import duckdb
+from flask import Flask
 import polars as pl
 
+import prep_app
+import prep_ops
+import prep_profile
 import settings
 import source
-from app import KEY, app, state
+from app import KEY, app
+import server
+from server import state
 
 # 지어낸 데이터: 고객 40명과 주문 300건. 고객 번호 41~45는 고객 표에 없다(조인에서 빈 값이 된다).
 random.seed(1)
@@ -43,7 +51,47 @@ for i in range(1, 301):
                    "amount": random.randint(1, 500) * 100, "ordered_on": day,
                    "paid_at": dt.datetime.combine(day, dt.time(random.randrange(24), random.randrange(60))),
                    "note": random.choice(NOTES)})
-DATA = ROOT / "data"
+# 전처리용 지어낸 데이터: 20행. 컬럼마다 지저분한 값 다섯 개(점수·날짜는 스무 개)를 되풀이한다.
+MESSY = {
+    "id": list(range(1, 21)),
+    "name": ["  Alice  ", "bob", "CAROL  ", "  dave", "Eve  Smith"] * 4,
+    "code": ["-", "", "N/A", "A1", None] * 4,
+    "price": ["1,200원", "3000", "abc", " 45 ", None] * 4,
+    "born": ["20260101", "20251231", "20260315", "20240229", None] * 4,
+    "seen": ["2026-01-05", "2026-13-01", "bad", "2026-03-01", None] * 4,
+    "grade": ["A", "B", None, "B", "C"] * 4,
+    "note": ["=1+1", "x", "@cmd", "ok", None] * 4,
+    "score": [10, 20, None, 40, 50, None, 30, 20, 10, None, 60, 20, None, 80, 90, 20, None, 10, 30, 20],
+    "rate": [1.5, 2.5, None, 4.0] * 5,
+    "day": [None if i % 5 == 4 else dt.date(2026, 1, 1) + dt.timedelta(days=i) for i in range(20)],
+    "at": [dt.time(9, 30), dt.time(18, 5), None, dt.time(12, 0)] * 5,
+    "flag": [True, False] * 10,
+    "amt": [5, 100, 1, 17, 9, 12, 3, 15, 7, 18, 2, None, 14, 6, 10, 16, 4, 13, 8, 11],
+    "ratio": [3.14159, 2.71828, None, 1.41421] * 5,
+    "neg": list(range(-9, 11)),
+    "flat": [7] * 20,
+    "city": ["Seoul", "Busan", "Seoul", "Daegu", "Seoul", "Busan", "Jeju", "Seoul", "Busan", None] * 2,
+    "mixed": ["Seoul", "SEOUL", "seoul", "Busan", "busan"] * 4,
+    "stamp": ["2026-03-05 14:07:09", "2026-12-31 23:59:59", "2026-03-05 25:00:00", "x", None] * 4,
+    "ap": ["2026-03-05 02:07 PM", "2026-03-05 12:07 am", "2026-03-05 13:07 PM", "x", None] * 4,
+    "mon": ["05 Mar 2026", "31 december 2026", "5 Mar 2026", "bad", None] * 4,
+    "short": ["26/03/05", "26/12/31", "26/13/01", "x", None] * 4,
+    "iso_dt": ["2026-03-05 14:07:09", "2026-12-31 23:59:59", "2025-01-01 00:00:00", "2024-02-29 12:00:00", None] * 4,
+    "isod": ["2026-01-05", "2026-02-10", "2025-12-31", "2024-02-29", "2026-07-07"] * 4,
+    "numstr": ["10", "20", "-", "40", "50"] * 4,
+    "decs": ["1.5", "2", "3.25", "-", "?"] * 4,
+    "money": ["1,200원", "3,000원", "4,500원", None, "7원"] * 4,
+    "const": ["x"] * 20,
+    "alln": pl.Series([None] * 20, dtype=pl.String),
+    "d8": list(range(20)),
+    "d16": [i * 100 for i in range(20)],
+    "d32": [i * 100_000 for i in range(20)],
+    "d64": [i * 10**9 for i in range(20)],
+    "dnull": pl.Series([None] * 20, dtype=pl.Int64),
+    "b8": [127] + [-128] * 19,
+    "b16": [128] + [0] * 19,
+}
+DATA, PREP, PREP_FLAT = ROOT / "data", ROOT / "prep", ROOT / "prep_flat"
 fails, done = [], []
 
 
@@ -56,6 +104,13 @@ def make_data():
     con.close()
     pl.DataFrame(customers[:5]).write_parquet(DATA / "flat" / "buyers.parquet")
     pl.DataFrame(orders[:5]).write_csv(DATA / "flat" / "sales.csv")
+    PREP.mkdir()
+    PREP_FLAT.mkdir()
+    frame = pl.DataFrame(MESSY)
+    con = duckdb.connect(str(PREP / "prep.duckdb"))
+    con.execute('create table messy as select * replace (cast("at" as time) as "at") from frame')  # Polars의 시간은 나노초라 DuckDB의 time으로 바꾼다.
+    con.close()
+    frame.write_parquet(PREP_FLAT / "messy.parquet")
 
 
 def check(name, got, want):
@@ -73,6 +128,351 @@ def raised(work):
         return type(e).__name__
 
 
+def prep_new(tag, got, error, only, preview, values):
+    """3단계 기능(행 거르기, 복사, 파생 컬럼, 새 전처리, 날짜시간 형식, 중복 제거, downcast, 추천). 두 연결에서 같은 값이 나와야 한다."""
+    amt, ids = MESSY["amt"], list(range(1, 21))
+    near = lambda items: [round(v, 6) if isinstance(v, float) else v for v in items]
+    spec = lambda col, **o: only(col, **{col: {"ops": o}})
+    ok = [v for v in amt if v is not None]
+    mean, sd = statistics.mean(ok), statistics.stdev(ok)
+
+    print("== 행 거르기·복사·파생 컬럼:", tag)
+    r = preview(only("id"), filters=["id >= 3", {"any": ["id = 4", "id = 5"]}])
+    check(tag + " filters: 조건끼리 and, any는 or", (values(r, "id"), r["before"], r["after"]), ([4, 5], 20, 2))
+    r = preview(only("id"), filters=["score is null"])
+    check(tag + " filters: 원본 컬럼 기준", (values(r, "id"), r["after"]), ([i for i, v in zip(ids, MESSY["score"]) if v is None], 5))
+    r = preview({**only("name"), "name2": {"ops": {"trim": True}}}, copies=[{"from": "name", "name": "name2"}])
+    check(tag + " copies: from 뒤에 놓고 원본 값으로 만든 뒤 복사 컬럼에 ops",
+          (r["rows"]["columns"], values(r, "name")[:2], values(r, "name2")[:2], r["sources"], r["derived"]),
+          (["name", "name2"], ["  Alice  ", "bob"], ["Alice", "bob"], ["name", "name2"], [False, False]))
+    r = preview({**only("id"), "id_b": {"rename": "B"}}, copies=[{"from": "id", "name": "id_b"}, {"from": "id", "name": "id_c"}])
+    check(tag + " copies: 같은 컬럼의 복사는 적은 순서, 복사 컬럼도 rename", (r["rows"]["columns"], r["sources"]), (["id", "B", "id_c"], ["id", "id_b", "id_c"]))
+    r = preview(only("score", score={"ops": {"flag": True, "fill": {"how": "value", "value": 0}}}))
+    check(tag + " flag: fill 앞의 빈 값 표시를 새 컬럼으로", (r["rows"]["columns"], values(r, "score"), values(r, "score_isnull"), r["types"], r["sources"], r["derived"]),
+          (["score", "score_isnull"], [v or 0 for v in MESSY["score"]], [v is None for v in MESSY["score"]], ["int64", "boolean"], ["score", "score"], [False, True]))
+    r = preview(only("id", score={"keep": False, "ops": {"flag": True}}))
+    check(tag + " 원래 컬럼을 빼도 파생 컬럼은 남음", (r["rows"]["columns"], r["derived"]), (["id", "score_isnull"], [False, True]))
+    r = preview(only("score", score={"rename": "pt", "ops": {"flag": True}}))
+    check(tag + " 파생 컬럼 이름은 rename 전 이름 기준", r["rows"]["columns"], ["pt", "score_isnull"])
+    r = preview(only("score", score={"ops": {"flag": True}}), drop=["score_isnull", "nothing", "score"])
+    check(tag + " drop: 파생 컬럼만 빼고 없는 이름은 무시", r["rows"]["columns"], ["score"])
+    check(tag + " 파생 컬럼 이름이 겹치면 거부", error("/api/preview", base="messy", columns=spec("score", flag=True), copies=[{"from": "id", "name": "score_isnull"}]),
+          "'score_isnull' 컬럼이 이미 있어 파생 컬럼을 만들 수 없습니다.")
+    day = MESSY["day"]
+    r = preview(spec("day", parts=["year", "month", "day", "weekday", "ym"]))
+    pick = lambda f: [None if d is None else f(d) for d in day]
+    check(tag + " parts(날짜): 이름·값·위치(월요일=0, ym은 그 달의 첫날)",
+          (r["rows"]["columns"], values(r, "day_year"), values(r, "day_month"), values(r, "day_day"), values(r, "day_weekday"), values(r, "day_ym"), r["types"][1:], r["derived"]),
+          (["day", "day_year", "day_month", "day_day", "day_weekday", "day_ym"], pick(lambda d: d.year), pick(lambda d: d.month), pick(lambda d: d.day),
+           pick(lambda d: d.weekday()), pick(lambda d: str(d.replace(day=1))), ["int64"] * 4 + ["date"], [False] + [True] * 5))
+    r = preview(spec("iso_dt", type={"to": "date", "format": "%Y-%m-%d %H:%M:%S"}, parts=["hour", "year"]))
+    check(tag + " parts(날짜시간): hour", (values(r, "iso_dt_hour"), values(r, "iso_dt_year")), ([14, 23, 0, 12, None] * 4, [2026, 2026, 2025, 2024, None] * 4))
+    check(tag + " 거부: date에 hour", error("/api/preview", base="messy", columns=spec("day", parts=["hour"])), "'hour'는 날짜시간 컬럼에만 쓸 수 있습니다. 'day' 컬럼은 날짜입니다.")
+    check(tag + " 거부: 문자에 parts", error("/api/preview", base="messy", columns=spec("name", parts=["year"])), "'parts'은 날짜 컬럼에만 쓸 수 있습니다. 'name' 컬럼은 문자입니다.")
+    seoul = ["Seoul", "Busan", "Seoul", "Daegu", "Seoul", "Busan", "Jeju", "Seoul", "Busan", None] * 2
+    code = {"Busan": 0, "Daegu": 1, "Jeju": 2, "Seoul": 3}
+    r = preview(only("id", "city", city={"ops": {"label": True}}), sorts=["id"])
+    check(tag + " label: 정렬한 순서의 번호, 빈 값은 빈 값", (r["rows"]["columns"], values(r, "city_label"), r["types"][2], r["after"]),
+          (["id", "city", "city_label"], [None if c is None else code[c] for c in seoul], "int64", 20))
+    r = preview(spec("day", label=True), sorts=["day"])
+    check(tag + " label: 날짜", values(r, "day_label")[:4], [0, 1, 2, 3])
+    r = preview(only("city", city={"ops": {"onehot": True}}))
+    check(tag + " onehot: 값 순서, 빈 값인 행은 모두 0, int8",
+          (r["rows"]["columns"], values(r, "city_Seoul"), values(r, "city_Busan")[-2:], r["types"][1:], r["derived"]),
+          (["city", "city_Busan", "city_Daegu", "city_Jeju", "city_Seoul"], [int(c == "Seoul") for c in seoul], [1 if seoul[-2] == "Busan" else 0, 0], ["int8"] * 4, [False] + [True] * 4))
+    check(tag + " 거부: onehot 상한", (setattr(prep_ops, "ONEHOT_MAX", 3), error("/api/preview", base="messy", columns=spec("city", onehot=True)))[1],
+          "'city' 컬럼은 서로 다른 값이 3개를 넘어 onehot을 만들 수 없습니다.")
+    prep_ops.ONEHOT_MAX = 50
+    check(tag + " 거부: label 상한", (setattr(prep_ops, "LABEL_MAX", 3), error("/api/preview", base="messy", columns=spec("city", label=True)))[1],
+          "'city' 컬럼은 서로 다른 값이 3개를 넘어 label을 만들 수 없습니다.")
+    prep_ops.LABEL_MAX = 10_000
+    check(tag + " 거부: label 이름이 겹침", error("/api/preview", base="messy", columns=spec("city", label=True), copies=[{"from": "id", "name": "city_label"}]),
+          "'city_label' 컬럼이 이미 있어 파생 컬럼을 만들 수 없습니다.")
+
+    print("== 새 전처리:", tag)
+    cases = [  # (이름, 컬럼, ops, 기대 값)
+        ("rare", "city", {"rare": {"min": 3}}, [c if c in ("Seoul", "Busan") or c is None else "기타" for c in seoul]),
+        ("rare: 이름 지정", "city", {"rare": {"min": 7, "label": "etc"}}, ["Seoul" if c == "Seoul" else "etc" if c else None for c in seoul]),
+        ("outlier range drop", "amt", {"outlier": {"how": "drop", "by": "range", "low": 2, "high": 17}}, [v for v in amt if v is None or 2 <= v <= 17]),
+        ("outlier range clip(한쪽만)", "amt", {"outlier": {"how": "clip", "by": "range", "high": 17}}, [None if v is None else min(v, 17) for v in amt]),
+        ("outlier iqr drop(Q1=5.5, Q3=14.5, k 1.5 → -8~28)", "amt", {"outlier": {"how": "drop", "by": "iqr"}}, [v for v in amt if v != 100]),
+        ("outlier iqr clip(k 0.5 → 1~19)", "amt", {"outlier": {"how": "clip", "by": "iqr", "k": 0.5}}, [None if v is None else min(max(v, 1), 19) for v in amt]),
+        ("outlier std drop", "amt", {"outlier": {"how": "drop", "by": "std"}}, [v for v in amt if v != 100]),
+        ("outlier std clip(k 0.5)", "amt", {"outlier": {"how": "clip", "by": "std", "k": 0.5}},
+         [None if v is None else min(max(v, mean - 0.5 * sd), mean + 0.5 * sd) for v in amt]),
+        ("scale minmax", "amt", {"scale": "minmax"}, [None if v is None else (v - 1) / 99 for v in amt]),
+        ("scale standard", "amt", {"scale": "standard"}, [None if v is None else (v - mean) / sd for v in amt]),
+        ("scale log", "amt", {"scale": "log"}, [None if v is None else math.log1p(v) for v in amt]),
+        ("round 2", "ratio", {"round": 2}, [3.14, 2.72, None, 1.41] * 5),
+        ("round 0", "ratio", {"round": 0}, [3.0, 3.0, None, 1.0] * 5),
+        ("bins", "amt", {"bins": [0, 10, 100]}, [None if v is None else "0–10" if v < 10 else "10–100" for v in amt]),
+        ("bins: 밖의 값은 빈 값, 소수 경계", "amt", {"bins": [4.5, 12]}, [None if v is None or not 4.5 <= v <= 12 else "4.5–12" for v in amt]),
+        ("type: 날짜시간(%H:%M:%S, 안 맞는 모양은 빈 값)", "stamp", {"type": {"to": "date", "format": "%Y-%m-%d %H:%M:%S"}},
+         ["2026-03-05 14:07:09", "2026-12-31 23:59:59", None, None, None] * 4),
+        ("type: 날짜시간(%I %p, 대소문자 무시)", "ap", {"type": {"to": "date", "format": "%Y-%m-%d %I:%M %p"}},
+         ["2026-03-05 14:07:00", "2026-03-05 00:07:00", None, None, None] * 4),
+        ("type: %b", "mon", {"type": {"to": "date", "format": "%d %b %Y"}}, ["2026-03-05", None, None, None, None] * 4),
+        ("type: %B(대소문자 무시)", "mon", {"type": {"to": "date", "format": "%d %B %Y"}}, [None, "2026-12-31", None, None, None] * 4),
+        ("type: %y", "short", {"type": {"to": "date", "format": "%y/%m/%d"}}, ["2026-03-05", "2026-12-31", None, None, None] * 4),
+        ("type: 형식 없이 날짜시간 글자는 빈 값", "iso_dt", {"type": {"to": "date"}}, [None] * 20),
+    ]
+    for name, col, o, want in cases:
+        check(f"{tag} {name}", near(values(preview(spec(col, **o)), col)), near(want))
+    windows = [
+        ("fill prev, 문자", "grade", {"fill": {"how": "prev", "by": "id"}}, ["A", "B", "B", "B", "C"] * 4),
+        ("fill next", "score", {"fill": {"how": "next", "by": "id"}}, [10, 20, 40, 40, 50, 30, 30, 20, 10, 60, 60, 20, 80, 80, 90, 20, 10, 10, 30, 20]),
+        ("fill prev", "score", {"fill": {"how": "prev", "by": "id"}}, [10, 20, 20, 40, 50, 50, 30, 20, 10, 10, 60, 20, 20, 80, 90, 20, 20, 10, 30, 20]),
+    ]
+    for name, col, o, want in windows:
+        r = got("/api/preview", base="messy", columns=only("id", col, **{col: {"ops": o}}), sorts=["id"])  # 창 함수는 행 순서를 바꾸므로 정렬한다.
+        if tag == "DuckDB":
+            check(f"{tag} {name}", values(r, col), want)
+        else:
+            check(f"{tag} {name}: 창 함수가 없는 연결은 지원하지 않는 계산이라고 알림", r.get("error", "").startswith("이 연결에서는 지원하지 않는 계산입니다."), True)
+    for name, col, o, count in [("outlier iqr drop", "amt", {"how": "drop", "by": "iqr"}, 19), ("outlier range drop", "amt", {"how": "drop", "by": "range", "low": 2, "high": 17}, 17)]:
+        r = preview(spec(col, outlier=o))
+        check(f"{tag} {name}: after", (r["before"], r["after"]), (20, count))
+    types = lambda col, **o: preview(spec(col, **o))["types"]
+    check(tag + " 날짜 형식에 시각이 있으면 timestamp, 없으면 date", (types("stamp", type={"to": "date", "format": "%Y-%m-%d %H:%M:%S"}), types("mon", type={"to": "date", "format": "%d %b %Y"})),
+          (["timestamp"], ["date"]))
+    bad = lambda col, **o: error("/api/preview", base="messy", columns=spec(col, **o))
+    for name, message, found in [
+        ("날짜 형식 글자", "날짜 형식에는 %Y %y %m %d %H %M %S %I %p %b %B만 쓸 수 있습니다. 예: %Y%m%d, %Y-%m-%d %H:%M:%S", bad("stamp", type={"to": "date", "format": "%Y %f"})),
+        ("문자에 outlier", "'outlier'은 정수·실수 컬럼에만 쓸 수 있습니다. 'name' 컬럼은 문자입니다.", bad("name", outlier={"how": "drop", "by": "iqr"})),
+        ("log 최솟값", "'neg' 컬럼의 최솟값이 -9로 -1 이하라 log로 바꿀 수 없습니다.", bad("neg", scale="log")),
+        ("표준편차 0", "'flat' 컬럼은 표준편차가 0이거나 구할 수 없어 standard로 바꿀 수 없습니다.", bad("flat", scale="standard")),
+        ("범위 0", "'flat' 컬럼은 값이 모두 같거나 비어 있어(범위가 0) minmax로 바꿀 수 없습니다.", bad("flat", scale="minmax")),
+        ("round 음수", "'amt' 컬럼의 'round' 값은 0 이상의 정수 형식으로 쓰세요.", bad("amt", round=-1)),
+        ("bins 순서", "'amt' 컬럼의 'bins' 값은 오름차순 경계값 2개 이상. 예: [0, 10, 100] 형식으로 쓰세요.", bad("amt", bins=[10, 5])),
+        ("rare min", "'city' 컬럼의 'rare' 값은 {\"min\": 2 이상의 정수, \"label\": \"기타\"} 형식으로 쓰세요.", bad("city", rare={"min": 1})),
+        ("outlier range에 한계 없음", "'amt' 컬럼의 'outlier' 값은 ", bad("amt", outlier={"how": "drop", "by": "range"})),
+        ("prev에 by 없음", "'score' 컬럼의 'fill' 값은 ", bad("score", fill={"how": "prev"})),
+        ("prev의 by가 없는 컬럼", "'zzz' 컬럼이 없습니다.", bad("score", fill={"how": "prev", "by": "zzz"})),
+    ]:
+        check(f"{tag} 거부: {name}", found[:len(message)], message)
+
+    print("== 중복·downcast:", tag)
+    r = preview(only("name"), dedupe=["name"])
+    check(tag + " dedupe: 일부 컬럼", (sorted(values(r, "name")), r["before"], r["after"]), (sorted(set(MESSY["name"])), 20, 5))
+    r = preview(only("name", "code"), dedupe=["name", "code"])
+    check(tag + " dedupe: 결과의 모든 컬럼이면 통째로 같은 행만", (sorted(zip(values(r, "name"), [c or "" for c in values(r, "code")])), r["after"]),
+          (sorted(set(zip(MESSY["name"], [c or "" for c in MESSY["code"]]))), 5))
+    check(tag + " dedupe: 값이 모두 다르면 그대로", preview(only("id"), dedupe=["id"])["after"], 20)
+    check(tag + " dedupe: 파생·복사 컬럼도 기준이 됨", preview(only("city", city={"ops": {"onehot": True}}), dedupe=["city_Seoul"])["after"], 2)
+    for name, body, want in [
+        ("일부 컬럼", dict(columns=only("name", "code"), dedupe=["name"]), {"groups": 5, "rows": 15}),
+        ("전체 컬럼", dict(columns=only("name", "code"), dedupe=["name", "code"]), {"groups": 5, "rows": 15}),
+        ("중복 없음", dict(columns=only("id"), dedupe=["id"]), {"groups": 0, "rows": 0}),
+        ("filters 뒤", dict(columns=only("name"), dedupe=["name"], filters=["id <= 10"]), {"groups": 5, "rows": 5}),
+    ]:
+        check(f"{tag} /api/dupes: {name}", got("/api/dupes", base="messy", **body), want)
+    check(tag + " dedupe 전후 행 수 = dupes의 rows", (preview(only("name"), dedupe=["name"])["after"], 20 - got("/api/dupes", base="messy", columns=only("name"), dedupe=["name"])["rows"]), (5, 5))
+    check(tag + " 거부: dedupe 기준 없음", error("/api/dupes", base="messy", dedupe=[]), "중복 기준 컬럼을 고르세요.")
+    check(tag + " 거부: dedupe 모르는 컬럼", error("/api/preview", base="messy", dedupe=["zzz"])[:15], "'zzz' 컬럼이 없습니다.")
+    check(tag + " 거부: drop이 목록이 아님", error("/api/preview", base="messy", drop="x"), "'drop'은 컬럼 이름 목록이어야 합니다.")
+    cols = ["d8", "d16", "d32", "d64", "dnull", "b8", "b16", "rate", "ratio"]
+    typed = lambda r: dict(zip(r["rows"]["columns"], r["types"]))
+    r = preview(only(*cols))
+    check(tag + " downcast 없이는 타입 그대로", typed(r), {**{c: "int64" for c in cols}, "rate": "float64", "ratio": "float64"})
+    r = preview(only(*cols), downcast=True)
+    check(tag + " downcast: 정수 범위별(경계 포함), 전부 빈 값은 그대로, 값이 안 바뀌는 실수만 float32", typed(r),
+          {"d8": "int8", "d16": "int16", "d32": "int32", "d64": "int64", "dnull": "int64", "b8": "int8", "b16": "int16", "rate": "float32", "ratio": "float64"})
+    check(tag + " downcast: 값은 그대로", [values(r, c) for c in ("d16", "d64", "b8", "b16", "rate", "ratio")],
+          [MESSY["d16"], MESSY["d64"], MESSY["b8"], MESSY["b16"], MESSY["rate"], MESSY["ratio"]])
+    r = preview(only("score", "rate"), downcast=True, dedupe=["score"])
+    check(tag + " dedupe 뒤에 downcast", r["types"], ["int8", "float32"])
+
+    print("== 추천:", tag)
+    suggest = {c["name"]: c["suggest"] for c in got("/api/profile", base="messy")["columns"]}
+    what = lambda col: [s["ops"] if "ops" in s else {"keep": s["keep"]} for s in suggest[col]]
+    want = {
+        "id": [], "flag": [], "name": [{"trim": True}],
+        "code": [{"nulls": ["", "-", "N/A"]}, {"fill": {"how": "mode"}}],  # A1 같은 코드는 숫자로 바꾸라고 하지 않는다.
+        "price": [{"trim": True}, {"fill": {"how": "mode"}}],
+        "born": [{"type": {"to": "date", "format": "%Y%m%d"}}, {"fill": {"how": "mode"}}],
+        "seen": [{"fill": {"how": "mode"}}],
+        "iso_dt": [{"type": {"to": "date", "format": "%Y-%m-%d %H:%M:%S"}}, {"fill": {"how": "mode"}}],
+        "isod": [{"type": {"to": "date"}}],
+        "numstr": [{"nulls": ["-"]}, {"type": {"to": "int"}}],
+        "decs": [{"nulls": ["-", "?"]}, {"type": {"to": "float"}}],
+        "money": [{"type": {"to": "int", "clean": True}}, {"fill": {"how": "mode"}}],
+        "mixed": [{"case": "lower"}],
+        "const": [{"keep": False}],
+        "alln": [{"keep": False}],
+        "score": [{"fill": {"how": "median"}}], "rate": [{"fill": {"how": "median"}}],
+        "amt": [{"fill": {"how": "median"}}],  # 빈 값이 1개(5.0%)라 5% 미만이 아니다.
+        "day": [{"fill": {"how": "mode"}}], "city": [{"fill": {"how": "mode"}}],
+    }
+    for col, ops_list in want.items():
+        check(f"{tag} 추천: {col}", what(col), ops_list)
+    check(tag + " 추천의 근거 문구에 숫자", (suggest["name"][0]["why"], suggest["amt"][0]["why"], suggest["code"][0]["why"]),
+          ("앞뒤에 공백이 있는 값이 12개 있습니다.", "빈 값이 1개(5.0%)입니다.", '빈 값을 뜻하는 글자가 있습니다: "" 4개, "-" 4개, "N/A" 4개'))
+    check(tag + " 추천: 빈 값이 5% 미만이면 fill drop", [s["ops"] for s in prep_profile.suggestions({"kind": "int", "nulls": 1, "unique": 9}, {}, 0, 100)], [{"fill": {"how": "drop"}}])
+    broken = [(col, i) for col, found in suggest.items() for i, s in enumerate(found) if "ops" in s
+              and "error" in got("/api/preview", base="messy", columns=only(col, **{col: {"ops": s["ops"]}}))]
+    check(tag + " 추천의 ops를 그대로 recipe에 넣으면 동작", broken, [])
+
+
+def prep_section():
+    """전처리 서버(prep_app). 같은 검사를 DuckDB 파일 연결과 Parquet 파일 연결에 모두 돌려 결과가 같은지 본다."""
+    pc = prep_app.app.test_client()
+    pc.set_cookie("key", KEY)  # prep.html은 다른 작업이라 쿠키만 직접 넣는다.
+    got = lambda api, **body: pc.post(api, json=body).get_json()
+    error = lambda api, **body: got(api, **body).get("error", "")
+    tables = lambda: sorted(pc.get("/api/tables").get_json()["tables"])
+    columns = list(MESSY)
+    only = lambda *names, **specs: {c: {**specs.get(c, {}), **({} if c in names else {"keep": False})} for c in columns}
+    ops = lambda name, **o: only(name, **{name: {"ops": o}})  # 컬럼 하나에 ops를 적용하고 그 컬럼만 본다.
+    preview = lambda cols, **extra: got("/api/preview", base="messy", columns=cols, **extra)
+    values = lambda r, name: [row[name] for row in r["rows"]["rows"]]
+    duck_file = got("/api/files", path=str(PREP))["files"][0]
+    flat_files = got("/api/files", path=str(PREP_FLAT))["flat"]
+    connections = [("DuckDB", dict(kind="folder", path=str(PREP), file=duck_file)), ("Parquet", dict(kind="folder", path=str(PREP_FLAT), files=flat_files))]
+
+    def stat(name, dtype, kind, nulls, unique, low=None, high=None, **strings):
+        return {"name": name, "type": dtype, "kind": kind, "nulls": nulls, "unique": unique, "min": low, "max": high, **strings}
+
+    text = lambda name, nulls, unique, min_len, max_len, blank, spaces, numeric: stat(
+        name, "string", "string", nulls, unique, min_len=min_len, max_len=max_len, blank=blank, spaces=spaces, numeric=numeric)
+    price_int, price_float = [1200, 3000, None, 45, None], [None, 3000.0, None, 45.0, None]
+    cases = [  # (이름, 컬럼, ops, 기대 값)
+        ("trim", "name", {"trim": True}, ["Alice", "bob", "CAROL", "dave", "Eve  Smith"] * 4),
+        ("squeeze", "name", {"squeeze": True}, [" Alice ", "bob", "CAROL ", " dave", "Eve Smith"] * 4),
+        ("remove: 두 칸 공백을 통째로", "name", {"remove": "  "}, ["Alice", "bob", "CAROL", "dave", "EveSmith"] * 4),
+        ("remove: 정규식이 아님", "name", {"remove": "."}, MESSY["name"]),
+        ("remove: 원", "price", {"remove": "원"}, ["1,200", "3000", "abc", " 45 ", None] * 4),
+        ("case upper", "name", {"case": "upper"}, ["  ALICE  ", "BOB", "CAROL  ", "  DAVE", "EVE  SMITH"] * 4),
+        ("case lower", "name", {"case": "lower"}, ["  alice  ", "bob", "carol  ", "  dave", "eve  smith"] * 4),
+        ("replace: 값이 같을 때만", "name", {"replace": [["bob", "BOB"], ["Eve", "X"]]}, ["  Alice  ", "BOB", "CAROL  ", "  dave", "Eve  Smith"] * 4),
+        ("replace: 여러 쌍", "grade", {"replace": [["A", "Z"], ["B", "Y"]]}, ["Z", "Y", None, "Y", "C"] * 4),
+        ("regex", "price", {"regex": ["[0-9]+", "#"]}, ["#,#원", "#", "abc", " # ", None] * 4),
+        ("nulls", "code", {"nulls": ["-", "N/A", ""]}, [None, None, None, "A1", None] * 4),
+        ("type: 정리하고 정수로", "price", {"type": {"to": "int", "clean": True}}, price_int * 4),
+        ("type: 실수로(앞뒤 공백은 무시, 못 바꾸면 빈 값)", "price", {"type": {"to": "float"}}, price_float * 4),
+        ("type: 날짜(형식 지정)", "born", {"type": {"to": "date", "format": "%Y%m%d"}}, ["2026-01-01", "2025-12-31", "2026-03-15", "2024-02-29", None] * 4),
+        ("type: 날짜(형식 없음, 못 바꾸면 빈 값)", "seen", {"type": {"to": "date"}}, ["2026-01-05", None, None, "2026-03-01", None] * 4),
+        ("type: 글자로", "score", {"type": {"to": "string"}}, [None if v is None else str(v) for v in MESSY["score"]]),
+        ("fill value: 수", "score", {"fill": {"how": "value", "value": 0}}, [v or 0 for v in MESSY["score"]]),
+        ("fill value: 글자", "grade", {"fill": {"how": "value", "value": "n/a"}}, ["A", "B", "n/a", "B", "C"] * 4),
+        ("fill mean", "score", {"fill": {"how": "mean"}}, [34.0 if v is None else v for v in MESSY["score"]]),
+        ("fill median", "score", {"fill": {"how": "median"}}, [20.0 if v is None else v for v in MESSY["score"]]),
+        ("fill mode: 수", "score", {"fill": {"how": "mode"}}, [20 if v is None else v for v in MESSY["score"]]),
+        ("fill mode: 글자", "grade", {"fill": {"how": "mode"}}, ["A", "B", "B", "B", "C"] * 4),
+        ("글자를 실수로 바꾼 뒤 mean", "price", {"type": {"to": "float", "clean": True}, "fill": {"how": "mean"}}, [1200.0, 3000.0, 1415.0, 45.0, 1415.0] * 4),
+        ("여러 op는 적어 둔 순서와 상관없이 고정 순서(trim → type → fill)", "price",
+         {"fill": {"how": "value", "value": 0}, "type": {"to": "int", "clean": True}, "trim": True}, [1200, 3000, 0, 45, 0] * 4),
+        ("nulls 다음에 case: 빈 값으로 볼 글자는 원래 보이는 대로(N/A) 적는다", "code", {"case": "lower", "nulls": ["-", "N/A"]}, [None, "", None, "a1", None] * 4),
+    ]
+    rejected = [  # (이름, 요청, 오류 문구가 시작하는 글)
+        ("모르는 전처리 항목", dict(base="messy", columns={"name": {"ops": {"trimm": True}}}), "'trimm' 전처리 항목이 없습니다. 비슷한 이름: trim"),
+        ("모르는 컬럼", dict(base="messy", columns={"zzz": {}}), "'zzz' 컬럼이 없습니다."),
+        ("모르는 테이블", dict(base="nothing"), "'nothing' 테이블이 없습니다."),
+        ("정수에 trim", dict(base="messy", columns={"id": {"ops": {"trim": True}}}), "'trim'은 문자 컬럼에만 쓸 수 있습니다. 'id' 컬럼은 정수입니다."),
+        ("글자에 mean", dict(base="messy", columns={"grade": {"ops": {"fill": {"how": "mean"}}}}), "'mean'은 정수·실수 컬럼에만 쓸 수 있습니다. 'grade' 컬럼은 문자입니다."),
+        ("replace 형식", dict(base="messy", columns={"name": {"ops": {"replace": ["a", "b"]}}}), "'name' 컬럼의 'replace' 값은 [[\"찾을 값\""),
+        ("trim: false", dict(base="messy", columns={"name": {"ops": {"trim": False}}}), "'name' 컬럼의 'trim' 값은 true 형식으로 쓰세요."),
+        ("type의 to", dict(base="messy", columns={"price": {"ops": {"type": {"to": "decimal"}}}}), "'price' 컬럼의 'type' 값은"),
+        ("fill에 value가 없음", dict(base="messy", columns={"score": {"ops": {"fill": {"how": "value"}}}}), "'score' 컬럼의 'fill' 값은"),
+        ("fill value가 컬럼 타입에 안 맞음", dict(base="messy", columns={"score": {"ops": {"fill": {"how": "value", "value": "abc"}}}}), "'abc'은 정수 값이 아닙니다."),
+        ("keep이 true/false가 아님", dict(base="messy", columns={"name": {"keep": "no"}}), "'name' 컬럼의 keep은 true/false"),
+        ("모르는 설정 키", dict(base="messy", columns={"name": {"drop": True}}), "'name' 컬럼의 설정은 keep, rename, ops만"),
+        ("이름이 겹침", dict(base="messy", columns={"id": {"rename": "name"}}), "결과에 'name' 컬럼이 둘 이상입니다. 이름을 바꾸세요."),
+        ("모든 컬럼을 뺌", dict(base="messy", columns={c: {"keep": False} for c in columns}), "남길 컬럼이 없습니다."),
+        ("바꾸기 전 이름으로 정렬", dict(base="messy", columns=only("id", id={"rename": "n"}), sorts=["id"]), "'id' 컬럼이 없습니다."),
+        ("잘못된 정렬 방향", dict(base="messy", sorts=["id up"]), "형식: 컬럼 [asc|desc]"),
+    ]
+    run_columns = only("id", "price", "note", price={"ops": {"trim": True, "type": {"to": "int", "clean": True}}})
+    expected = {"id": list(range(20, 0, -1)), "price": [price_int[(i - 1) % 5] for i in range(20, 0, -1)],
+                "note": [MESSY["note"][i - 1] for i in range(20, 0, -1)]}
+    run_file = lambda kind: pc.post("/api/run", json={"recipe": {"base": "messy", "columns": run_columns, "sorts": ["id desc"]}, "target": {"kind": "file", "format": kind}})
+    bad_target = "저장 방식은 file(parquet, csv) 또는 table이어야 합니다."
+
+    for tag, connect in connections:
+        print("== 전처리:", tag)
+        check(tag + " 연결", "schemas" in got("/api/connect", **connect), True)
+        profile = got("/api/profile", base="messy")
+        check(tag + " profile: 행 수와 컬럼 순서", (profile["rows"], [c["name"] for c in profile["columns"]]), (20, columns))
+        want = [
+            stat("id", "int64", "int", 0, 20, 1, 20),
+            text("name", 0, 5, 3, 10, 0, 12, 0),
+            text("code", 4, 4, 0, 3, 4, 0, 0),
+            text("price", 4, 4, 3, 6, 0, 4, 8),
+            text("born", 4, 4, 8, 8, 0, 0, 16),
+            text("seen", 4, 4, 3, 10, 0, 0, 0),
+            text("grade", 4, 3, 1, 1, 0, 0, 0),
+            text("note", 4, 4, 1, 4, 0, 0, 0),
+            stat("score", "int64", "int", 5, 8, 10, 90),
+            stat("rate", "float64", "float", 5, 3, 1.5, 4.0),
+            stat("day", "date", "date", 4, 16, "2026-01-01", "2026-01-19"),
+            stat("at", "time", "time", 5, 3, "09:30:00", "18:05:00"),
+            stat("flag", "boolean", "bool", 0, 2),
+        ]
+        for w, g in zip(want, profile["columns"]):
+            check(f"{tag} profile: {w['name']}", {k: v for k, v in g.items() if k != "suggest"}, w)
+        for name, col, o, want in cases:
+            check(f"{tag} {name}", values(preview(ops(col, **o)), col), want)
+        r = preview(ops("score", fill={"how": "mean"}))
+        check(tag + " preview: 컬럼 이름, 타입, 행 수", (r["rows"]["columns"], r["types"], r["before"], r["after"]), (["score"], ["float64"], 20, 20))
+        r = preview(ops("score", fill={"how": "drop"}))
+        check(tag + " fill drop: 그 컬럼이 빈 행을 뺌", (values(r, "score"), r["before"], r["after"]), ([v for v in MESSY["score"] if v is not None], 20, 15))
+        r = preview(only("score", "rate", score={"ops": {"fill": {"how": "drop"}}}, rate={"ops": {"fill": {"how": "mean"}}}))
+        kept = [i for i, v in enumerate(MESSY["score"]) if v is not None]  # score에서 행을 뺀 뒤의 rate 평균은 32/11이다(전체 평균은 8/3).
+        check(tag + " 컬럼 차례대로: 앞 컬럼에서 뺀 행을 빼고 평균을 구함", [round(v, 6) for v in values(r, "rate")], [MESSY["rate"][i] or round(32 / 11, 6) for i in kept])
+        r = preview(only("score", "name", "id", id={"rename": "n"}, name={"rename": "who", "ops": {"trim": True}}), sorts=["n desc", "who"])
+        check(tag + " keep·rename·sorts: 원래 순서, 새 이름으로 정렬", (r["rows"]["columns"], values(r, "n")[:3], values(r, "who")[:2]),
+              (["n", "who", "score"], [20, 19, 18], ["Eve  Smith", "dave"]))
+        for name, body, message in rejected:
+            check(f"{tag} 거부: {name}", error("/api/preview", **body)[:len(message)], message)
+        check(tag + " profile: 없는 테이블", error("/api/profile", base="nothing"), "'nothing' 테이블이 없습니다.")
+
+        prep_new(tag, got, error, only, preview, values)
+
+        print("== 전처리 파일 저장:", tag)
+        data = run_file("parquet").data
+        saved = pl.read_parquet(io.BytesIO(data))
+        check(tag + " Parquet: 값과 타입", (saved.columns, saved.to_dict(as_series=False), saved.schema["price"]), (["id", "price", "note"], expected, pl.Int64))
+        data = run_file("csv").data
+        saved = pl.read_csv(io.BytesIO(data))
+        check(tag + " CSV: 다시 읽은 값", (data[:3], saved.columns, saved.to_dict(as_series=False)), (b"\xef\xbb\xbf", ["id", "price", "note"], expected))
+        check(tag + " CSV: 수식 막기('를 붙이기)를 하지 않음", (b"=1+1" in data, b"'=1+1" in data, b"'@cmd" in data), (True, False, False))
+        check(tag + " Excel은 거부", error("/api/run", recipe={"base": "messy"}, target={"kind": "file", "format": "xlsx"}), bad_target)
+        check(tag + " 모르는 저장 방식은 거부", error("/api/run", recipe={"base": "messy"}, target={"kind": "folder"}), bad_target)
+
+    print("== 전처리: 새 테이블 만들기")
+    got("/api/connect", **connections[1][1])
+    check("Parquet 연결에서 table은 거부", error("/api/run", recipe={"base": "messy"}, target={"kind": "table", "name": "out"}),
+          "Parquet·CSV 파일 연결에는 테이블을 만들 DB가 없습니다. 파일로 저장하세요.")
+    got("/api/connect", **connections[0][1])
+    make = lambda name, cols=run_columns, **recipe: got("/api/run", recipe={"base": "messy", "columns": cols, **recipe}, target={"kind": "table", "name": name})
+    check("DuckDB 파일에 새 테이블", make("clean_out", sorts=["id"]), {"ok": True, "rows": 20})
+    check("테이블 목록에 생김", tables(), ["clean_out", "messy"])
+    r = got("/api/preview", base="clean_out")
+    check("만든 테이블의 값", (r["rows"]["columns"], values(r, "id"), values(r, "price"), r["types"]),
+          (["id", "price", "note"], list(range(1, 21)), price_int * 4, ["int64", "int64", "string"]))
+    check("fill drop은 만든 테이블의 행 수가 줄어듦", make("dropped", only("score", score={"ops": {"fill": {"how": "drop"}}})), {"ok": True, "rows": 15})
+    check("같은 이름은 만들기 전에 거부(대소문자 무시)", [error("/api/run", recipe={"base": "messy"}, target={"kind": "table", "name": n}) for n in ("clean_out", "CLEAN_OUT")],
+          ["'clean_out'은 이미 있는 테이블입니다.", "'CLEAN_OUT'은 이미 있는 테이블입니다."])
+    check("테이블 이름 제한", [error("/api/run", recipe={"base": "messy"}, target={"kind": "table", "name": n})[:7] for n in ("", "a b", "a.b", "a'b", '"x"', "x;y")], ["테이블 이름은"] * 6)
+    check("한글·숫자·밑줄 이름", make("결과_2", only("id")), {"ok": True, "rows": 20})
+    check("잘못된 recipe는 만들지 않고 연결도 그대로", (error("/api/run", recipe={"base": "messy", "columns": {"zzz": {}}}, target={"kind": "table", "name": "bad"})[:15], tables()),
+          ("'zzz' 컬럼이 없습니다.", ["clean_out", "dropped", "messy", "결과_2"]))
+    check("만든 뒤에도 읽기 전용 연결", (state["opened"]["kind"], raised(lambda: state["con"].create_table("late", schema={"a": "int"})) is not None, got("/api/rowcount", base="clean_out")),
+          ("folder", True, {"rows": 20}))
+    hold = duckdb.connect(duck_file, read_only=True)  # 다른 프로그램이 읽기 전용으로 열고 있는 경우
+    e = error("/api/run", recipe={"base": "messy"}, target={"kind": "table", "name": "blocked"})
+    hold.close()
+    check("쓰기로 못 열면 이유를 알려 주고 읽기 전용 연결을 되살림", (e.startswith("쓰기로 열 수 없습니다."), got("/api/rowcount", base="dropped")), (True, {"rows": 15}))
+    check("그 뒤에는 다시 만들 수 있음", make("blocked", only("id")), {"ok": True, "rows": 20})
+    check("label이 든 recipe로 테이블 만들기", make("labeled", only("id", "city", city={"ops": {"label": True}}), sorts=["id"]), {"ok": True, "rows": 20})
+    r = got("/api/preview", base="labeled", sorts=["id"])
+    check("만든 테이블의 label 값", values(r, "city_label"), [None if c is None else {"Busan": 0, "Daegu": 1, "Jeju": 2, "Seoul": 3}[c] for c in MESSY["city"]])
+    got("/api/connect", kind="url", url=f"duckdb://{duck_file}")
+    check("주소 연결은 그 연결로 바로 만듦(스키마 지정)", make("from_url", only("id", "name", name={"ops": {"trim": True}}), schema="main"), {"ok": True, "rows": 20})
+    r = got("/api/preview", schema="main", base="from_url", sorts=["id desc"])
+    check("주소 연결에서 만든 테이블의 값", (values(r, "name")[:2], r["before"]), (["Eve  Smith", "dave"], 20))
+    got("/api/disconnect")
+
+
 def main():
     make_data()
     c = app.test_client()
@@ -84,25 +484,43 @@ def main():
 
     print("== 열쇠")
     check("열쇠 없는 요청은 403", c.get("/api/tables").status_code, 403)
-    r = c.get("/?key=" + KEY)
-    nonce = re.search(r"script-src 'nonce-([^']+)'", r.headers.get("Content-Security-Policy", ""))
-    check("화면의 스크립트는 모두 CSP의 nonce를 가짐", r.text.count("<script") == r.text.count(f'<script nonce="{nonce and nonce.group(1)}"') > 0, True)
+    for path in ("/", "/search", "/prep"):
+        r = c.get(path + "?key=" + KEY)
+        nonce = re.search(r"script-src 'nonce-([^']+)'", r.headers.get("Content-Security-Policy", ""))
+        check(f"{path} 화면의 스크립트는 모두 CSP의 nonce를 가짐", (r.status_code, r.text.count("<script") == r.text.count(f'<script nonce="{nonce and nonce.group(1)}"') > 0), (200, True))
+    static = ROOT / "static"  # 지어낸 파일로 확인한다. 실제 static은 건드리지 않는다.
+    static.mkdir()
+    (static / "frag.html").write_text("<p>조각</p>", encoding="utf-8")
+    (static / "page.html").write_text("<!--include frag.html--><script>1</script>", encoding="utf-8")
+    with Flask(__name__, static_folder=str(static)).app_context():
+        html = server.page("page.html").get_data(as_text=True)
+    check("page: include를 내용으로 바꾸고 그 안의 스크립트에도 nonce를 붙임", ("include" in html, "<p>조각</p>" in html, "<script nonce=" in html), (False, True, True))
     check("그 뒤로는 쿠키로 통과, 최근 연결은 아직 없음", c.get("/api/recent").get_json(), {"recent": None})
 
     print("== 연결")
+    check("/api/state: 연결 전", c.get("/api/state").get_json(), {"connected": False})
     found = got("/api/files", path=str(DATA))
     check("/api/files", ([Path(f).name for f in found["files"]], [Path(f).name for f in found["flat"]]), (["shop.duckdb"], ["buyers.parquet", "sales.csv"]))
     duck = found["files"][0]
     check("Parquet·CSV 파일 연결", got("/api/connect", kind="folder", path=str(DATA), files=found["flat"]), {"schemas": []})
     check("파일마다 테이블 하나", (tables(), got("/api/query", base="sales")["count"]), (["buyers", "sales"], 5))
+    check("/api/state: Parquet·CSV 연결은 files를 포함", c.get("/api/state").get_json(),
+          {"connected": True, "opened": {"kind": "folder", "path": str(DATA), "files": found["flat"]}, "schemas": []})
     check("Parquet·CSV 연결은 SQL을 보여 줄 수 없음", error("/api/sql", base="sales"), "이 연결의 조회는 SQL로 보여 줄 수 없습니다.")
     got("/api/connect", kind="url", url=f"duckdb://{duck}")
     check("주소로 연결", tables(), ["customers", "orders"])
+    r = c.get("/api/state").get_json()
+    check("/api/state: 주소 연결", (r["connected"], r["opened"], "main" in r["schemas"]), (True, {"kind": "url", "url": f"duckdb://{duck}", "user": ""}, True))
+    real = state["opened"]
+    state["opened"] = {"kind": "url", "url": "postgres://me:secret-pw@host/db", "user": "me", "password": "field-pw"}  # 비밀번호가 든 연결 요청 값
+    check("/api/state: 비밀번호는 칸에 쓴 것도 주소 안에 쓴 것도 내보내지 않음", ("secret-pw" in c.get("/api/state").text, "field-pw" in c.get("/api/state").text), (False, False))
+    state["opened"] = real
     check("/api/recent", c.get("/api/recent").get_json()["recent"], {"kind": "url", "url": f"duckdb://{duck}", "user": ""})
     e = error("/api/connect", kind="url", url="nosuch://someone:inline-pw-1@host/db", user="me", password="field-pw-2")
     check("연결 오류에서 비밀번호를 가림", ("***" in e, "inline-pw-1" in e, "field-pw-2" in e), (True, False, False))
     check("연결에 실패하면 이전 연결을 다시 엶", tables(), ["customers", "orders"])
     check("DuckDB 파일 연결", "main" in got("/api/connect", kind="folder", path=str(DATA), file=duck).get("schemas", []), True)
+    check("/api/state: DuckDB 파일 연결은 file을 포함", c.get("/api/state").get_json()["opened"], {"kind": "folder", "path": str(DATA), "file": duck})
     check("최근 연결에 주소 안의 비밀번호를 남기지 않음", source.recent({"kind": "url", "url": "postgres://me:secret@host/db", "user": "me"}),
           {"kind": "url", "url": "postgres://me@host/db", "user": "me"})
     check("짧은 비밀번호는 주소의 비밀번호 자리에서만 가림", source.mask("db://me:ab@host/ab", ["ab"]), "db://me:***@host/ab")
@@ -188,6 +606,52 @@ def main():
     check("검색 지우기", got("/api/searches", name="mine", search=None), {"searches": {}})
     check("빈 이름은 거절", error("/api/searches", name=" ", search=saved), "검색 이름은 1자 이상 50자 이하로 입력하세요.")
 
+    print("== 검색 결과를 파일로 저장하고 그 파일에 연결(handoff)")
+    out, asked = ROOT / "out", []
+    out.mkdir()
+
+    def choose(path):
+        """저장 대화상자를 대신해 path를 고르는 함수. 묻는 기본 이름을 asked에 적어 둔다."""
+        return lambda name: (asked.append(name), path)[1]
+
+    body = dict(base="orders", conditions=["note = =1+1"], columns=["order_id, note"], sorts=["order_id"])
+    mine = [o for o in orders if o["note"] == "=1+1"]
+    got("/api/connect", kind="folder", path=str(DATA), file=duck)
+    server.ask_save = None
+    check("저장 위치를 물을 수 없으면 거부", error("/api/handoff", **body), "저장 위치를 물을 수 없습니다. 프로그램 창에서만 쓸 수 있습니다.")
+    server.ask_save = choose(str(out / "picked"))
+    check("handoff: 확장자 없으면 .parquet을 붙이고 경로·테이블 이름을 돌려줌", (got("/api/handoff", **body), asked),
+          ({"path": str(out / "picked.parquet"), "table": "picked"}, ["orders_search.parquet"]))
+    saved = pl.read_parquet(out / "picked.parquet")
+    check("저장된 Parquet: 조건에 맞는 전체 행, 표시 컬럼, 수식 막기 없는 원래 값", (saved.columns, saved["order_id"].to_list(), set(saved["note"].to_list())),
+          (["order_id", "note"], [o["order_id"] for o in mine], {"=1+1"}))
+    check("저장 뒤 연결이 그 파일 하나로 바뀜", (c.get("/api/state").get_json(), tables()),
+          ({"connected": True, "opened": {"kind": "folder", "path": str(out), "files": [str(out / "picked.parquet")]}, "schemas": []}, ["picked"]))
+    check("그 테이블로 profile·rowcount·검색이 됨", (got("/api/profile", base="picked")["rows"], got("/api/rowcount", base="picked"), got("/api/query", base="picked")["count"]),
+          (len(mine), {"rows": len(mine)}, len(mine)))
+    check("최근 연결에도 남음", c.get("/api/recent").get_json()["recent"], {"kind": "folder", "path": str(out)})
+    before = (out / "picked.parquet").stat()
+    again = dict(base="picked", conditions=["order_id >= 0"])
+    check("지금 읽고 있는 파일(대소문자 달라도)에는 저장하지 않음", [(setattr(server, "ask_save", choose(str(out / n))), error("/api/handoff", **again))[1] for n in ("picked.parquet", "PICKED.parquet", "picked")],
+          ["지금 읽고 있는 파일에는 저장할 수 없습니다. 다른 이름을 고르세요."] * 3)
+    after = (out / "picked.parquet").stat()
+    check("거부해도 파일과 연결은 그대로", ((before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns), tables()), (True, ["picked"]))
+    server.ask_save = lambda name: None
+    check("취소하면 cancelled", (got("/api/handoff", **again), tables()), ({"cancelled": True}, ["picked"]))
+    server.ask_save = choose(str(out / "x.txt"))
+    check("다른 확장자에도 .parquet을 붙임", (got("/api/handoff", base="picked", columns=["order_id"])["path"], tables()), (str(out / "x.txt.parquet"), ["x.txt"]))
+    server.ask_save = choose(str(out / "Y.PARQUET"))
+    check("대문자 확장자는 그대로", got("/api/handoff", **{**again, "base": "x.txt"})["path"], str(out / "Y.PARQUET"))
+    server.ask_save = choose(str(out / "picked.parquet"))
+    check("읽고 있지 않은 기존 파일은 덮어씀", (got("/api/handoff", base="Y", conditions=["order_id < 100"])["table"], got("/api/rowcount", base="picked")),
+          ("picked", {"rows": sum(o["order_id"] < 100 for o in mine)}))
+    server.ask_save = choose(str(out / "nodir" / "a.parquet"))
+    check("쓰기에 실패하면 이전 연결을 유지하고 만들다 만 파일을 남기지 않음", (bool(error("/api/handoff", **again)), tables(), sorted(p.name for p in out.iterdir())),
+          (True, ["picked"], ["Y.PARQUET", "picked.parquet", "x.txt.parquet"]))
+    asked.clear()
+    check("잘못된 검색은 저장 위치를 묻기 전에 거부", (error("/api/handoff", base="nothing")[:20], asked), ("'nothing' 테이블이 없습니다.", []))
+    server.ask_save = None
+
     print("== 기다리기·연결 해제")
     check("within: 시간을 넘기면 TimeoutError", raised(lambda: source.within(0.05, lambda: time.sleep(0.3), "늦음")), "TimeoutError")
     wake = threading.Event()
@@ -195,6 +659,7 @@ def main():
     check("within: 밖에서 깨우면 InterruptedError", raised(lambda: source.within(5, lambda: time.sleep(0.3), "늦음", wake)), "InterruptedError")
     check("/api/disconnect", got("/api/disconnect"), {"ok": True})
     check("연결을 끊은 뒤", c.get("/api/tables").get_json(), {"error": "먼저 연결하세요."})
+    prep_section()
 
 
 try:

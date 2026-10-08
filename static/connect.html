@@ -1,0 +1,20 @@
+<h2>1. 연결</h2>
+<div class="tabs">
+  <label><input type="radio" name="kind" value="folder" checked style="width:auto"> 내 폴더 파일</label>
+  <label><input type="radio" name="kind" value="url" style="width:auto"> DB 주소</label>
+</div>
+<div id="folder-box">
+  <div class="row"><input id="path" placeholder="폴더 경로 (예: ./data)" value="."><button id="find">찾기</button></div>
+  <select id="file" class="hidden"></select>
+  <div id="flat" class="hidden">
+    <div class="row"><button class="ghost" id="flat-all">모두 선택</button><button class="ghost" id="flat-none">모두 해제</button><span class="hint" id="flat-count"></span></div>
+    <div class="cols" id="flat-list"></div>
+  </div>
+</div>
+<div id="url-box" class="hidden">
+  <input id="url" placeholder="mssql://host:1433/db" style="margin-bottom:6px">
+  <input id="user" placeholder="아이디 (없으면 비움)" style="margin-bottom:6px">
+  <input id="password" type="password" placeholder="비밀번호 (없으면 비움)">
+</div>
+<div class="row" style="margin-top:6px"><button id="connect">연결</button></div>
+<div class="err" id="err-connect"></div>

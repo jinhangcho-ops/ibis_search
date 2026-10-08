@@ -10,14 +10,14 @@ OPS = {"=": operator.eq, "!=": operator.ne, ">=": operator.ge, "<=": operator.le
 CONDITION_GUIDE = "컬럼 >= 값 / 컬럼 != 값 / 컬럼 between 값1 값2 / 컬럼 in 값1, 값2 / 컬럼 except 값1, 값2 / 컬럼 like 값 / 컬럼 is [not] null / 조건 or 조건 / 값에 or·쉼표가 있으면 '값'"
 SORT_GUIDE = "컬럼 [asc|desc]"
 
-# (판별, 한글 이름, 입력값 변환)
+# (판별, 종류, 한글 이름, 입력값 변환). 종류는 전처리가 컬럼을 나눌 때 쓴다.
 TYPES = [
-    (lambda t: t.is_boolean(), "참/거짓", lambda s: {"true": True, "false": False}[s.lower()]),
-    (lambda t: t.is_integer(), "정수", int),
-    (lambda t: t.is_floating() or t.is_decimal(), "실수", float),
-    (lambda t: t.is_date(), "날짜", dt.date.fromisoformat),
-    (lambda t: t.is_timestamp(), "날짜시간", dt.datetime.fromisoformat),
-    (lambda t: t.is_string(), "문자", str),
+    (lambda t: t.is_boolean(), "bool", "참/거짓", lambda s: {"true": True, "false": False}[s.lower()]),
+    (lambda t: t.is_integer(), "int", "정수", int),
+    (lambda t: t.is_floating() or t.is_decimal(), "float", "실수", float),
+    (lambda t: t.is_date(), "date", "날짜", dt.date.fromisoformat),
+    (lambda t: t.is_timestamp(), "date", "날짜시간", dt.datetime.fromisoformat),
+    (lambda t: t.is_string(), "string", "문자", str),
 ]
 
 COND_RE = re.compile(r"^(\S+?)\s*(!=|>=|<=|=|>|<)\s*(.+)$")
@@ -33,7 +33,12 @@ QUOTE_RE = re.compile(r"""(?<![^\s,=<>])(['"])(?:.*?\1(?![^\s,]))?""")
 
 def type_info(dtype):
     """(한글 이름, 변환 함수). 모르는 타입은 문자로 다룬다."""
-    return next(((name, cast) for check, name, cast in TYPES if check(dtype)), (str(dtype), str))
+    return next(((name, cast) for check, _, name, cast in TYPES if check(dtype)), (str(dtype), str))
+
+
+def kind(dtype):
+    """int, float, string, date(날짜·날짜시간), bool, time, other 중 하나."""
+    return next((k for check, k, *_ in TYPES if check(dtype)), "time" if dtype.is_time() else "other")
 
 
 def convert(dtype, text):
@@ -169,6 +174,18 @@ def parse_one(line, expr, quotes=True):
         value = convert(schema[col], unquote(raw, quotes))
         return OPS[op](expr[col], value)
     raise ValueError(f"형식: {CONDITION_GUIDE}")
+
+
+def predicate(cond, expr):
+    """조건 하나를 Ibis 식으로. 문자열, 따옴표 해석을 끈 {"line": ..., "quotes": False},
+    화면에서 or로 이은 묶음 {"any": [조건, ...]} 중 하나다. 묶음 안은 or, 조건끼리는 and."""
+    if isinstance(cond, str):
+        return parse_condition(cond, expr)
+    if "any" in cond:
+        if not cond["any"]:
+            raise ValueError("or로 묶을 조건이 없습니다.")
+        return functools.reduce(operator.or_, [predicate(c, expr) for c in cond["any"]])
+    return parse_condition(cond["line"], expr, cond.get("quotes", True))
 
 
 # 정렬: "컬럼 [asc|desc]"

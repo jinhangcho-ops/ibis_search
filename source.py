@@ -22,8 +22,8 @@ def find_files(folder):
     return duckdb_files, flat_files
 
 
-def open_duckdb(path):
-    return ibis.duckdb.connect(path, read_only=True)
+def open_duckdb(path, read_only=True):
+    return ibis.duckdb.connect(path, read_only=read_only)
 
 
 def table_names(paths):
